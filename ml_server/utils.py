@@ -5,7 +5,13 @@ import time
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 
 
 # ── Logger ────────────────────────────────────────────────────────────────
@@ -59,6 +65,11 @@ def compute_metrics(y_true, y_pred, training_time: float | None = None) -> dict:
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
+    # labels=[0, 1] фіксує порядок: 0=REAL (negative), 1=FAKE (positive).
+    # sklearn повертає [[tn, fp], [fn, tp]] — UI/API чекає dict формат.
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = (int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1]))
+
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, pos_label=1, zero_division=0)),
@@ -67,6 +78,7 @@ def compute_metrics(y_true, y_pred, training_time: float | None = None) -> dict:
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
         "f1_fake": float(f1_score(y_true, y_pred, pos_label=1, zero_division=0)),
         "f1_real": float(f1_score(y_true, y_pred, pos_label=0, zero_division=0)),
+        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
     }
     if training_time is not None:
         metrics["training_time"] = round(training_time, 2)
