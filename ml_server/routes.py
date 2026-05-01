@@ -19,7 +19,7 @@ from ml_server.features import (
     STYLISTIC_FEATURES,
 )
 from ml_server.gnn_trainer import train_gnn
-from ml_server.nb_trainer import train_nb
+from ml_server.nb_trainer import train_nb, train_nb_aggregated
 from ml_server.upload_handlers import (
     dataset_status,
     handle_upload_chunk,
@@ -347,8 +347,36 @@ def _run_training_impl(payload: dict):
 
     tmpdir = None
     try:
-        # ── Branch 1: NB — aggregated ──
+        # ── Branch 1: NB — article-level (DEFAULT, apples-to-apples) ──
         if model_type == "nb":
+            train_df, val_df, test_df, _, data_stats, tmpdir = (
+                build_article_level_data(
+                    dataset_id=dataset_id, dataset_name=dataset_name,
+                    test_ratio=float(data_params.get("test_ratio", 0.15)),
+                    val_ratio=float(data_params.get("val_ratio", 0.15)),
+                    min_text_length=int(data_params.get("min_text_length", 30)),
+                    seed=int(data_params.get("seed", 42)),
+                    require_tweets=False,
+                )
+            )
+            # alpha=None у model_params → auto-tune. Якщо передано — фіксований.
+            alpha_param = model_params.get("alpha")
+            alpha_val = float(alpha_param) if alpha_param is not None else None
+
+            result = train_nb(
+                train_df, val_df, test_df,
+                user_id=user_id, experiment_id=experiment_id,
+                nb_variant=model_params.get("nb_variant", "complement"),
+                vectorizer_type=model_params.get("vectorizer_type", "tfidf"),
+                ngram_range=model_params.get("ngram_range", "1,2"),
+                alpha=alpha_val,
+                tfidf_max_features=int(model_params.get("tfidf_max_features", 50000)),
+                preprocessing=preprocessing,
+            )
+            result["data_stats"] = data_stats
+
+        # ── Branch 1b: NB — aggregated (legacy, для ablation) ──
+        elif model_type == "nb_aggregated":
             train_df, test_df, data_stats, tmpdir = build_aggregated_data(
                 dataset_id=dataset_id,
                 dataset_name=dataset_name,
@@ -365,7 +393,7 @@ def _run_training_impl(payload: dict):
             rhetorical_features = [f for f in enabled if f in RHETORICAL_FEATURES]
             social_features = list(additional.get("social_extra", []) or [])
 
-            result = train_nb(
+            result = train_nb_aggregated(
                 train_df, test_df,
                 user_id=user_id, experiment_id=experiment_id,
                 emotional_features=emotional_features,

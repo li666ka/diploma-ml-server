@@ -33,6 +33,26 @@ def test_config():
     print(f"✓ Config OK (DATASETS_ROOT={DATASETS_ROOT})")
 
 
+def test_train_nb_signature():
+    """Перевіряє що train_nb прийняв val_df (article-level pipeline)."""
+    import inspect
+    from ml_server.nb_trainer import train_nb, train_nb_aggregated
+
+    sig = inspect.signature(train_nb)
+    params = list(sig.parameters)
+    assert params[:5] == ["train_df", "val_df", "test_df", "user_id", "experiment_id"], (
+        f"train_nb has unexpected positional params: {params[:5]}"
+    )
+    # alpha має default None → auto-tune
+    assert sig.parameters["alpha"].default is None
+    # legacy функція має лишитись доступною
+    legacy_sig = inspect.signature(train_nb_aggregated)
+    assert "train_df" in legacy_sig.parameters
+    assert "test_df" in legacy_sig.parameters
+    assert "val_df" not in legacy_sig.parameters
+    print("✓ train_nb article-level signature OK; train_nb_aggregated preserved")
+
+
 def test_app_factory():
     from ml_server.app import create_app
     app = create_app()
@@ -60,5 +80,6 @@ def test_app_factory():
 if __name__ == "__main__":
     test_imports()
     test_config()
+    test_train_nb_signature()
     test_app_factory()
     print("\n✅ All smoke tests passed")
