@@ -13,6 +13,11 @@ from ml_server.distilbert_trainer import (
     get_distilbert_state,
     train_distilbert_article_level,
 )
+from ml_server.features import (
+    EMOTIONAL_FEATURES,
+    RHETORICAL_FEATURES,
+    STYLISTIC_FEATURES,
+)
 from ml_server.gnn_trainer import train_gnn
 from ml_server.nb_trainer import train_nb
 from ml_server.upload_handlers import (
@@ -352,9 +357,22 @@ def _run_training_impl(payload: dict):
                 test_ratio=float(data_params.get("test_ratio", 0.20)),
                 seed=int(data_params.get("seed", 42)),
             )
+            additional = model_params.get("additional_features", {}) or {}
+            mask = additional.get("mask", {}) or {}
+            enabled = [k for k, v in mask.items() if v]
+            emotional_features = [f for f in enabled if f in EMOTIONAL_FEATURES]
+            stylistic_features = [f for f in enabled if f in STYLISTIC_FEATURES]
+            rhetorical_features = [f for f in enabled if f in RHETORICAL_FEATURES]
+            social_features = list(additional.get("social_extra", []) or [])
+
             result = train_nb(
                 train_df, test_df,
                 user_id=user_id, experiment_id=experiment_id,
+                emotional_features=emotional_features,
+                stylistic_features=stylistic_features,
+                rhetorical_features=rhetorical_features,
+                social_features=social_features,
+                use_text=bool(payload.get("use_text", True)),
                 nb_variant=model_params.get("nb_variant", "complement"),
                 vectorizer_type=model_params.get("vectorizer_type", "tfidf"),
                 ngram_range=model_params.get("ngram_range", "1,2"),
