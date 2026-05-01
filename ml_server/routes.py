@@ -69,7 +69,22 @@ def register_routes(app: Flask):
     # ── Training (sync) ───────────────────────────────────────────────────
     @app.route("/run_training", methods=["POST"])
     def run_training():
-        return _run_training_impl(request.json or {})
+        payload = request.json or {}
+        if not payload:
+            return jsonify({"error": "JSON body required"}), 400
+        try:
+            result = _run_training_impl(payload)
+            return jsonify(result)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except FileNotFoundError as e:
+            log.error(f"Dataset not found: {e}")
+            return jsonify({"error": str(e)}), 404
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error(f"Training failed: {e}\n{tb}")
+            return jsonify({"error": str(e), "traceback": tb}), 500
 
     # ── Training (async) ──────────────────────────────────────────────────
     @app.route("/run_training_async", methods=["POST"])
@@ -100,21 +115,8 @@ def register_routes(app: Flask):
 
                 payload["_progress_callback"] = _progress
                 result = _run_training_impl(payload)
-                if isinstance(result, tuple):
-                    response, code = result
-                    if code != 200:
-                        _set_job(
-                            job_id, status="failed",
-                            error=response.get_json().get("error"),
-                            finished_at=datetime.utcnow().isoformat(),
-                        )
-                        return
-                    result_data = response.get_json()
-                else:
-                    result_data = result.get_json()
-
                 _set_job(
-                    job_id, status="done", result=result_data,
+                    job_id, status="done", result=result,
                     finished_at=datetime.utcnow().isoformat(),
                 )
             except Exception as e:
@@ -322,11 +324,18 @@ def register_routes(app: Flask):
 
 # ── /run_training implementation ──────────────────────────────────────────
 
-def _run_training_impl(payload: dict):
-    """Shared logic for sync and async training."""
-    if not payload:
-        return jsonify({"error": "JSON body required"}), 400
+def _run_training_impl(payload: dict) -> dict:
+    """Pure shared logic for sync and async training.
 
+    Returns: dict із результатами тренування (метрики, шлях моделі, тощо).
+    Raises:
+        ValueError           — для bad-request випадків (HTTP 400 у sync wrapper).
+        FileNotFoundError    — коли датасет не знайдено (HTTP 404).
+        Exception            — будь-яка інша помилка тренування (HTTP 500).
+
+    NB: НЕ викликати ``jsonify`` тут — у async-thread немає Flask app context.
+    Sync і async ендпоїнти обертають результат / ловлять exceptions самі.
+    """
     user_id = payload.get("user_id", "unknown")
     experiment_id = payload.get("experiment_id", "default")
     model_type = payload.get("model_type", "nb").lower()
@@ -338,7 +347,7 @@ def _run_training_impl(payload: dict):
     progress_callback = payload.get("_progress_callback")
 
     if dataset_id is None and not dataset_name:
-        return jsonify({"error": "dataset_id або dataset_name потрібно"}), 400
+        raise ValueError("dataset_id або dataset_name потрібно")
 
     log.info(
         f"user={user_id}, exp={experiment_id}, model={model_type}, "
@@ -450,20 +459,10 @@ def _run_training_impl(payload: dict):
             result["data_stats"] = data_stats
 
         else:
-            return jsonify({"error": f"Unknown model_type: {model_type}"}), 400
+            raise ValueError(f"Unknown model_type: {model_type}")
 
         log.info(f"✓ Training complete: {result['metrics']}")
-        return jsonify(result)
-
-    except FileNotFoundError as e:
-        log.error(f"Dataset not found: {e}")
-        return jsonify({"error": f"Dataset not found: {e}"}), 404
-
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        log.error(f"Training failed: {e}\n{tb}")
-        return jsonify({"error": str(e), "traceback": tb}), 500
+        return result
 
     finally:
         if tmpdir and os.path.exists(tmpdir):
