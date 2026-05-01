@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ml_server.config import AGGREGATED_SOCIAL_COLS
-from ml_server.data_loader import resolve_dataset_path
+from ml_server.data_loader import _try_load_external_splits, resolve_dataset_path
 from ml_server.utils import log
 
 
@@ -136,14 +136,28 @@ def build_aggregated_data(
     min_text_length: int = 30,
     test_ratio: float = 0.20,
     seed: int = 42,
+    splits_subdir: Optional[str] = None,
 ):
-    """Build aggregated train/test для NB. Returns (train, test, stats, tmpdir)."""
+    """Build aggregated train/test для NB. Returns (train, test, stats, tmpdir).
+
+    Args:
+        splits_subdir: ім'я папки `splits_*` для зовнішніх splits.
+            None → fallback на legacy `splits/`, інакше random split.
+            Aggregated режим не використовує val_df: якщо знайдено external
+            splits з val — він мерджиться у train.
+    """
     import os
 
     csv_dir, tmpdir = resolve_dataset_path(dataset_id, dataset_name)
 
-    news = pd.read_csv(os.path.join(csv_dir, "news.csv"), low_memory=False)
-    tweets = pd.read_csv(os.path.join(csv_dir, "tweets.csv"), low_memory=False)
+    news = pd.read_csv(
+        os.path.join(csv_dir, "news.csv"),
+        low_memory=False, dtype={"article_id": str},
+    )
+    tweets = pd.read_csv(
+        os.path.join(csv_dir, "tweets.csv"),
+        low_memory=False, dtype={"article_id": str},
+    )
 
     users = None
     users_path = os.path.join(csv_dir, "users.csv")
@@ -154,16 +168,32 @@ def build_aggregated_data(
 
     # Length filter
     df = df[df["text"].str.len() >= min_text_length].copy()
+    df["article_id"] = df["article_id"].astype(str)
 
-    # Random split (можна замінити на stratified якщо треба)
-    rng = np.random.RandomState(seed)
-    all_ids = df["article_id"].tolist()
-    shuffled = rng.permutation(all_ids).tolist()
-    n_test = max(1, int(len(shuffled) * test_ratio))
-    test_ids = set(shuffled[:n_test])
+    # ── External splits (optional) → fallback на random split ──
+    external = _try_load_external_splits(csv_dir, df, splits_subdir=splits_subdir)
+    if external is not None:
+        train_part, val_part, test_df = external
+        # NB-aggregated не має окремого val — мерджимо у train.
+        if len(val_part) > 0:
+            train_df = pd.concat([train_part, val_part], ignore_index=True)
+        else:
+            train_df = train_part.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+        if splits_subdir:
+            splits_used = splits_subdir.replace("splits_", "", 1)
+        else:
+            splits_used = "splits"  # legacy
+    else:
+        rng = np.random.RandomState(seed)
+        all_ids = df["article_id"].tolist()
+        shuffled = rng.permutation(all_ids).tolist()
+        n_test = max(1, int(len(shuffled) * test_ratio))
+        test_ids = set(shuffled[:n_test])
 
-    train_df = df[~df["article_id"].isin(test_ids)].reset_index(drop=True)
-    test_df = df[df["article_id"].isin(test_ids)].reset_index(drop=True)
+        train_df = df[~df["article_id"].isin(test_ids)].reset_index(drop=True)
+        test_df = df[df["article_id"].isin(test_ids)].reset_index(drop=True)
+        splits_used = "auto"
 
     stats = {
         "mode": "aggregated",
@@ -174,6 +204,7 @@ def build_aggregated_data(
         "label_test_fake": int((test_df["label"] == 1).sum()),
         "label_test_real": int((test_df["label"] == 0).sum()),
         "social_feature_cols": list(AGGREGATED_SOCIAL_COLS),
+        "splits_used": splits_used,
     }
 
     return train_df, test_df, stats, tmpdir

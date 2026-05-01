@@ -60,6 +60,64 @@ def resolve_dataset_path(
     raise FileNotFoundError(f"Dataset не знайдено. Шукав:\n    {searched}")
 
 
+def _try_load_external_splits(
+    csv_dir: str,
+    news: pd.DataFrame,
+    splits_subdir: Optional[str] = None,
+):
+    """Try to load pre-computed splits from CSV files.
+
+    Args:
+        csv_dir: dataset folder path
+        news: filtered DataFrame з article_id (вже після length filter і label)
+        splits_subdir: name of splits folder (наприклад "splits_cross_domain").
+            If None — fallback на legacy "splits/" якщо існує.
+            If string — використовує цю папку конкретно. Якщо її нема —
+            log.warning і повертає None (caller робить fallback на auto-split).
+
+    Returns: (train_df, val_df, test_df) або None.
+    """
+    if splits_subdir:
+        splits_dir = os.path.join(csv_dir, splits_subdir)
+        if not os.path.isdir(splits_dir):
+            log.warning(
+                f"Requested splits folder not found: {splits_subdir}. "
+                f"Will use auto-split."
+            )
+            return None
+    else:
+        splits_dir = os.path.join(csv_dir, "splits")
+        if not os.path.isdir(splits_dir):
+            return None
+
+    train_csv = os.path.join(splits_dir, "split_train.csv")
+    val_csv = os.path.join(splits_dir, "split_val.csv")
+    test_csv = os.path.join(splits_dir, "split_test.csv")
+    for path in (train_csv, val_csv, test_csv):
+        if not os.path.exists(path):
+            log.warning(
+                f"Missing {os.path.basename(path)} in "
+                f"{os.path.basename(splits_dir)}/. Will use auto-split."
+            )
+            return None
+
+    log.info(f"✓ Loading external splits from {os.path.basename(splits_dir)}/")
+
+    train_ids = set(pd.read_csv(train_csv, dtype={"article_id": str})["article_id"])
+    val_ids = set(pd.read_csv(val_csv, dtype={"article_id": str})["article_id"])
+    test_ids = set(pd.read_csv(test_csv, dtype={"article_id": str})["article_id"])
+
+    train_df = news[news["article_id"].isin(train_ids)].reset_index(drop=True)
+    val_df = news[news["article_id"].isin(val_ids)].reset_index(drop=True)
+    test_df = news[news["article_id"].isin(test_ids)].reset_index(drop=True)
+
+    log.info(
+        f"  External splits: train={len(train_df):,} "
+        f"val={len(val_df):,} test={len(test_df):,}"
+    )
+    return train_df, val_df, test_df
+
+
 def build_article_level_data(
     dataset_id: int | str,
     dataset_name: Optional[str] = None,
@@ -68,9 +126,14 @@ def build_article_level_data(
     min_text_length: int = 30,
     seed: int = 42,
     require_tweets: bool = False,
+    splits_subdir: Optional[str] = None,
 ):
     """
     Article-level dataset для DistilBERT і GNN.
+
+    Args:
+        splits_subdir: ім'я папки `splits_*` для зовнішніх splits (опціонально).
+            None → fallback на legacy `splits/` якщо є, інакше auto-split.
 
     Returns: (train_df, val_df, test_df, full_data_dict, stats, tmpdir)
 
@@ -78,7 +141,7 @@ def build_article_level_data(
       train/val/test_df — DataFrame з [article_id, label, combined_text, ...]
       full_data_dict    — {tweets, retweets, replies, users} (тільки якщо
                           require_tweets=True)
-      stats             — статистика
+      stats             — статистика (включно зі `splits_used`)
       tmpdir            — для cleanup після ZIP
     """
     csv_dir, tmpdir = resolve_dataset_path(dataset_id, dataset_name)
@@ -100,22 +163,30 @@ def build_article_level_data(
     news["label"] = (
         news["article_label"].astype(str).str.upper() == "FAKE"
     ).astype(int)
-
-    # ── Stratified split 70/15/15 ──
     news = news.reset_index(drop=True)
-    trainval, test_df = train_test_split(
-        news, test_size=test_ratio,
-        stratify=news["label"], random_state=seed,
-    )
-    val_relative = val_ratio / (1 - test_ratio)
-    train_df, val_df = train_test_split(
-        trainval, test_size=val_relative,
-        stratify=trainval["label"], random_state=seed,
-    )
 
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
+    # ── External splits (optional) → fallback на stratified auto-split ──
+    external = _try_load_external_splits(csv_dir, news, splits_subdir=splits_subdir)
+    if external is not None:
+        train_df, val_df, test_df = external
+        if splits_subdir:
+            splits_used = splits_subdir.replace("splits_", "", 1)
+        else:
+            splits_used = "splits"  # legacy
+    else:
+        trainval, test_df = train_test_split(
+            news, test_size=test_ratio,
+            stratify=news["label"], random_state=seed,
+        )
+        val_relative = val_ratio / (1 - test_ratio)
+        train_df, val_df = train_test_split(
+            trainval, test_size=val_relative,
+            stratify=trainval["label"], random_state=seed,
+        )
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+        splits_used = "auto"
 
     log.info(f"  Train: {len(train_df):,} (FAKE={(train_df.label==1).sum():,}, "
              f"REAL={(train_df.label==0).sum():,})")
@@ -141,6 +212,7 @@ def build_article_level_data(
         "val_real": int((val_df.label == 0).sum()),
         "test_fake": int((test_df.label == 1).sum()),
         "test_real": int((test_df.label == 0).sum()),
+        "splits_used": splits_used,
     }
 
     return train_df, val_df, test_df, full_data, stats, tmpdir

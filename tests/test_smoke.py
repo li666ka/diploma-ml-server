@@ -61,6 +61,7 @@ def test_app_factory():
         "/health",
         "/list_datasets",
         "/dataset_status",
+        "/list_splits",
         "/upload_chunk",
         "/upload_finalize",
         "/run_training",

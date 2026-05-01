@@ -131,3 +131,58 @@ def dataset_status():
         "files": files,
         "path": str(target),
     })
+
+
+def list_splits():
+    """GET /list_splits?dataset_id=X.
+
+    Сканує dataset folder і повертає список splits_* папок.
+    """
+    dataset_id = request.args.get("dataset_id")
+    if not dataset_id:
+        return jsonify({"error": "dataset_id required"}), 400
+
+    target = Path(DATASETS_ROOT) / str(dataset_id)
+    if not target.exists():
+        return jsonify({"error": f"Dataset {dataset_id} not found"}), 404
+
+    def count_rows(path: Path) -> int:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return max(0, sum(1 for _ in f) - 1)  # minus header
+        except Exception:
+            return 0
+
+    splits_list = []
+    has_legacy = False
+
+    for d in sorted(target.iterdir()):
+        if not d.is_dir():
+            continue
+
+        if d.name == "splits":
+            has_legacy = True
+            continue
+
+        if not d.name.startswith("splits_"):
+            continue
+
+        train_csv = d / "split_train.csv"
+        val_csv = d / "split_val.csv"
+        test_csv = d / "split_test.csv"
+        if not (train_csv.exists() and val_csv.exists() and test_csv.exists()):
+            continue
+
+        splits_list.append({
+            "name": d.name[len("splits_"):],
+            "folder": d.name,
+            "train_count": count_rows(train_csv),
+            "val_count": count_rows(val_csv),
+            "test_count": count_rows(test_csv),
+        })
+
+    return jsonify({
+        "dataset_id": dataset_id,
+        "splits": splits_list,
+        "has_legacy_splits": has_legacy,
+    })

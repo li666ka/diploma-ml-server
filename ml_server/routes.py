@@ -25,6 +25,7 @@ from ml_server.upload_handlers import (
     handle_upload_chunk,
     handle_upload_finalize,
     list_datasets,
+    list_splits,
 )
 from ml_server.utils import log, preprocess_text
 
@@ -57,6 +58,10 @@ def register_routes(app: Flask):
     @app.route("/dataset_status", methods=["GET"])
     def _dataset_status():
         return dataset_status()
+
+    @app.route("/list_splits", methods=["GET"])
+    def _list_splits():
+        return list_splits()
 
     @app.route("/upload_chunk", methods=["POST"])
     def _upload_chunk():
@@ -349,9 +354,11 @@ def _run_training_impl(payload: dict) -> dict:
     if dataset_id is None and not dataset_name:
         raise ValueError("dataset_id або dataset_name потрібно")
 
+    splits_subdir = data_params.get("splits_subdir")  # може бути None
+
     log.info(
         f"user={user_id}, exp={experiment_id}, model={model_type}, "
-        f"dataset_id={dataset_id}"
+        f"dataset_id={dataset_id}, splits_subdir={splits_subdir}"
     )
 
     tmpdir = None
@@ -366,6 +373,7 @@ def _run_training_impl(payload: dict) -> dict:
                     min_text_length=int(data_params.get("min_text_length", 30)),
                     seed=int(data_params.get("seed", 42)),
                     require_tweets=False,
+                    splits_subdir=splits_subdir,
                 )
             )
             # alpha=None у model_params → auto-tune. Якщо передано — фіксований.
@@ -393,6 +401,7 @@ def _run_training_impl(payload: dict) -> dict:
                 min_text_length=int(data_params.get("min_text_length", 30)),
                 test_ratio=float(data_params.get("test_ratio", 0.20)),
                 seed=int(data_params.get("seed", 42)),
+                splits_subdir=splits_subdir,
             )
             additional = model_params.get("additional_features", {}) or {}
             mask = additional.get("mask", {}) or {}
@@ -428,6 +437,7 @@ def _run_training_impl(payload: dict) -> dict:
                     min_text_length=int(data_params.get("min_text_length", 30)),
                     seed=int(data_params.get("seed", 42)),
                     require_tweets=False,
+                    splits_subdir=splits_subdir,
                 )
             )
             result = train_distilbert_article_level(
@@ -448,6 +458,7 @@ def _run_training_impl(payload: dict) -> dict:
                     min_text_length=int(data_params.get("min_text_length", 30)),
                     seed=int(data_params.get("seed", 42)),
                     require_tweets=True,
+                    splits_subdir=splits_subdir,
                 )
             )
             result = train_gnn(
