@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# Models / data (не комітимо)
+*.pkl
+*.pt
+*.pth
+*.ckpt
+embeddings/
+graphs/
+data/
+datasets/
+models/
+chunks/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks output
+.ipynb_checkpoints/
+
+# Env
+.env
+.env.local
+
+# Drive sync artifacts
+.gdrive/
