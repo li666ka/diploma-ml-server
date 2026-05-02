@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import emoji
 from collections import defaultdict
+import os
 
 
 def load_nrc_el(path):
@@ -457,8 +458,11 @@ def extract_features(text, nrc_el, nrc_eil, feature_names, user_row=None):
 
 
 try:
-    nrc_el = load_nrc_el("NRC/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt")
-    nrc_eil = load_nrc_eil("NRC/NRC-Emotion-Intensity-Lexicon-v1.txt")
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    nrc_el_path = os.path.join(_THIS_DIR, "NRC", "NRC-Emotion-Lexicon-Wordlevel-v0.92.txt")
+    nrc_eil_path = os.path.join(_THIS_DIR, "NRC", "NRC-Emotion-Intensity-Lexicon-v1.txt")
+    nrc_el = load_nrc_el(nrc_el_path)
+    nrc_eil = load_nrc_eil(nrc_eil_path)
     if not nrc_el or not nrc_eil:
         raise ValueError("NRC lexicon empty")
     print(f"✓ NRC-EL: {len(nrc_el):,} words")
