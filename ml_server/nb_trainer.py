@@ -254,6 +254,7 @@ def train_nb(
     preprocessing: Optional[dict] = None,
     additional_features: Optional[list] = None,
     full_data: Optional[dict] = None,
+    use_text: bool = True,
 ):
     """Article-level NB на ``combined_text`` (article_title + article_text).
 
@@ -271,9 +272,20 @@ def train_nb(
         alpha: float — фіксоване значення (skip auto-tune); None — auto-tune.
         tfidf_max_features: розмір словника.
         preprocessing: опції для preprocess_text.
+        use_text: True (default) — pipeline містить TF-IDF tokens.
+            False — pipeline тільки на ``additional_features`` (для ablation
+            studies, напр. "emotional only", "stylistic only"). Якщо
+            ``use_text=False`` але ``additional_features`` порожні —
+            raise ValueError.
     """
     if preprocessing is None:
         preprocessing = {}
+
+    if not use_text and not additional_features:
+        raise ValueError(
+            "Cannot train NB with use_text=False AND no additional_features. "
+            "Need at least one feature source (text tokens OR engineered features)."
+        )
 
     text_col = "combined_text"
     if text_col not in train_df.columns:
@@ -302,8 +314,8 @@ def train_nb(
     y_test = df_test["label"].astype(int).values
 
     log.info(
-        f"train_nb (article-level): variant={nb_variant}, vec={vectorizer_type}, "
-        f"ngrams={ngram_range}, train={len(df_train)}, "
+        f"train_nb (article-level): variant={nb_variant}, use_text={use_text}, "
+        f"vec={vectorizer_type}, ngrams={ngram_range}, train={len(df_train)}, "
         f"val={len(df_val) if df_val is not None else 0}, test={len(df_test)}"
     )
 
@@ -395,8 +407,21 @@ def train_nb(
     use_features = bool(add_feat_cols)
 
     def _make_pipeline(a):
-        """Build pipeline for given alpha. With or without additional features."""
-        if use_features:
+        """Build pipeline for given alpha. 3 режими:
+
+        - Mode A (use_text=True, no features):  TfidfVectorizer → NB
+        - Mode B (use_text=True, with features): ColumnTransformer(text+num) → NB
+        - Mode C (use_text=False, with features): MinMaxScaler(num only) → NB
+        """
+        if not use_text and use_features:
+            # Mode C: features only, без TF-IDF
+            return Pipeline([
+                ("num_scaler", MinMaxScaler()),
+                ("classifier", get_nb_classifier(nb_variant, a)),
+            ])
+
+        if use_text and use_features:
+            # Mode B: TF-IDF + features
             transformers = [
                 ("text_vec",
                  get_vectorizer(vectorizer_type, ngram_range, tfidf_max_features),
@@ -407,6 +432,8 @@ def train_nb(
                 ("preprocessor", ColumnTransformer(transformers=transformers)),
                 ("classifier", get_nb_classifier(nb_variant, a)),
             ])
+
+        # Mode A: TF-IDF only (use_text=True, no features)
         return Pipeline([
             ("vectorizer", get_vectorizer(
                 vectorizer_type, ngram_range, tfidf_max_features
@@ -415,8 +442,13 @@ def train_nb(
         ])
 
     def _make_X(df_part):
-        if use_features:
+        if not use_text and use_features:
+            # Mode C: тільки numerical features (numpy для MinMaxScaler)
+            return df_part[add_feat_cols].values
+        if use_text and use_features:
+            # Mode B: text + features (DataFrame для ColumnTransformer)
             return df_part[["text_processed"] + add_feat_cols]
+        # Mode A: тільки text
         return df_part["text_processed"].values
 
     X_train = _make_X(df_train)
@@ -479,8 +511,13 @@ def train_nb(
         + (f", roc_auc={metrics['roc_auc']:.4f}" if metrics.get("roc_auc") is not None else "")
     )
 
-    # top_words: для ColumnTransformer-based pipeline vectorizer лежить інакше.
-    if use_features:
+    # top_words: доступні тільки коли є TF-IDF vectorizer.
+    if not use_text:
+        # Mode C: top_words недоступні (нема text vectorizer)
+        top_words = {"fake": [], "real": []}
+        log.info("  use_text=False → top_words skipped (no TF-IDF)")
+    elif use_features:
+        # Mode B: extract з ColumnTransformer preprocessor
         top_words = {"fake": [], "real": []}
         try:
             preproc = pipeline.named_steps["preprocessor"]
@@ -503,6 +540,7 @@ def train_nb(
         except Exception as e:
             log.warning(f"top words extraction (with features) failed: {e}")
     else:
+        # Mode A: standalone vectorizer
         top_words = _extract_top_words(pipeline)
 
     save_path = (
@@ -522,6 +560,7 @@ def train_nb(
         "alpha_search": alpha_search,
         "tfidf_max_features": tfidf_max_features,
         "additional_features": list(additional_features) if additional_features else [],
+        "use_text": use_text,
     }
     joblib.dump(bundle, save_path)
     log.info(f"  Saved article-level NB → {save_path}")

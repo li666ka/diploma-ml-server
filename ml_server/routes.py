@@ -406,6 +406,7 @@ def _run_training_impl(payload: dict) -> dict:
                 preprocessing=preprocessing,
                 additional_features=enabled_features,
                 full_data=full_data,
+                use_text=bool(model_params.get("use_text", True)),
             )
             result["data_stats"] = data_stats
 

@@ -439,8 +439,14 @@ def extract_graph_features(
             mask_failed = ts_numeric.isna()
             if mask_failed.any():
                 try:
+                    # Twitter API format: "Sun May 25 08:06:04 +0000 2014".
+                    # Explicit format → vectorized parser (~50× швидше за
+                    # dateutil per-row) і без UserWarning.
                     ts_datetime = pd.to_datetime(
-                        raw[mask_failed], errors="coerce", utc=True,
+                        raw[mask_failed],
+                        format="%a %b %d %H:%M:%S %z %Y",
+                        errors="coerce",
+                        utc=True,
                     )
                     valid_dt = ts_datetime.dropna()
                     if len(valid_dt) > 0:
