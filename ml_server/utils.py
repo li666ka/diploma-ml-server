@@ -2,7 +2,7 @@
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 from sklearn.metrics import (
@@ -11,6 +11,7 @@ from sklearn.metrics import (
     f1_score,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
 
 
@@ -60,7 +61,12 @@ def preprocess_text(text: str, opts: dict | None = None) -> str:
 
 # ── Metrics ───────────────────────────────────────────────────────────────
 
-def compute_metrics(y_true, y_pred, training_time: float | None = None) -> dict:
+def compute_metrics(
+    y_true,
+    y_pred,
+    training_time: Optional[float] = None,
+    y_proba: Optional[np.ndarray] = None,
+) -> dict:
     """Стандартний набір метрик для бінарної класифікації."""
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -80,6 +86,23 @@ def compute_metrics(y_true, y_pred, training_time: float | None = None) -> dict:
         "f1_real": float(f1_score(y_true, y_pred, pos_label=0, zero_division=0)),
         "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
     }
+
+    if y_proba is not None:
+        try:
+            proba = np.asarray(y_proba)
+            # Підтримати і [N] (probas FAKE), і [N, 2] (full)
+            if proba.ndim == 2 and proba.shape[1] >= 2:
+                proba = proba[:, 1]
+            # ROC-AUC undefined якщо в y_true тільки один клас
+            if len(np.unique(y_true)) >= 2:
+                metrics["roc_auc"] = float(roc_auc_score(y_true, proba))
+            else:
+                log.warning("ROC-AUC undefined: y_true has only one class")
+                metrics["roc_auc"] = None
+        except Exception as e:
+            log.warning(f"ROC-AUC computation failed: {e}")
+            metrics["roc_auc"] = None
+
     if training_time is not None:
         metrics["training_time"] = round(training_time, 2)
     return metrics

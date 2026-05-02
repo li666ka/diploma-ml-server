@@ -13,6 +13,13 @@ from ml_server.config import MODELS_ROOT
 from ml_server.utils import compute_metrics, create_download_url, log, preprocess_text
 
 
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable softmax уздовж останньої осі."""
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    exps = np.exp(shifted)
+    return exps / exps.sum(axis=-1, keepdims=True)
+
+
 # Globals для inference
 _distilbert_model = None
 _distilbert_tokenizer = None
@@ -181,13 +188,24 @@ def train_distilbert_article_level(
     # Final eval on TEST
     log.info("Final evaluation on test set...")
     test_predictions = trainer.predict(test_dataset)
-    y_pred = np.argmax(test_predictions.predictions, axis=-1)
+    logits = test_predictions.predictions  # numpy array, shape [N, 2]
+    y_pred = np.argmax(logits, axis=-1)
     y_test = df_test["label"].values
 
-    metrics = compute_metrics(y_test, y_pred, elapsed)
+    # ROC-AUC: ймовірність FAKE класу через softmax(logits)[:, 1]
+    probs = _softmax(logits)
+    y_proba_fake = probs[:, 1]
+
+    metrics = compute_metrics(y_test, y_pred, elapsed, y_proba=y_proba_fake)
     metrics["train_size"] = len(df_train)
     metrics["val_size"] = len(df_val)
     metrics["test_size"] = len(df_test)
+
+    log.info(
+        f"DistilBERT done: acc={metrics['accuracy']:.4f}, "
+        f"f1={metrics['f1_score']:.4f}, f1_macro={metrics['f1_macro']:.4f}"
+        + (f", roc_auc={metrics['roc_auc']:.4f}" if metrics.get("roc_auc") is not None else "")
+    )
 
     # Save
     model.save_pretrained(save_dir)

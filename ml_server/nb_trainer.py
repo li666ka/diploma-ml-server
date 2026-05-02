@@ -192,7 +192,15 @@ def train_nb(
     elapsed = round(time.time() - t0, 2)
 
     y_pred = pipeline.predict(X_test)
-    metrics = compute_metrics(y_test, y_pred, elapsed)
+
+    # ROC-AUC: predict_proba повертає [N, 2], беремо стовпець FAKE (index 1)
+    try:
+        y_proba = pipeline.predict_proba(X_test)[:, 1]
+    except Exception as e:
+        log.warning(f"predict_proba failed: {e}, ROC-AUC буде відсутній")
+        y_proba = None
+
+    metrics = compute_metrics(y_test, y_pred, elapsed, y_proba=y_proba)
     metrics["train_size"] = len(X_train)
     if best_val_f1 is not None:
         metrics["val_f1_macro"] = round(float(best_val_f1), 4)
@@ -200,6 +208,7 @@ def train_nb(
     log.info(
         f"NB (article-level) done: acc={metrics['accuracy']:.4f}, "
         f"f1={metrics['f1_score']:.4f}, f1_macro={metrics['f1_macro']:.4f}"
+        + (f", roc_auc={metrics['roc_auc']:.4f}" if metrics.get("roc_auc") is not None else "")
     )
 
     top_words = _extract_top_words(pipeline)
@@ -327,12 +336,21 @@ def train_nb_aggregated(
     elapsed = round(time.time() - t0, 2)
 
     y_pred = pipeline.predict(X_test)
-    metrics = compute_metrics(y_test, y_pred, elapsed)
+
+    # ROC-AUC: predict_proba повертає [N, 2], беремо стовпець FAKE (index 1)
+    try:
+        y_proba = pipeline.predict_proba(X_test)[:, 1]
+    except Exception as e:
+        log.warning(f"predict_proba failed: {e}, ROC-AUC буде відсутній")
+        y_proba = None
+
+    metrics = compute_metrics(y_test, y_pred, elapsed, y_proba=y_proba)
     metrics["train_size"] = len(X_train)
 
     log.info(
         f"NB (aggregated) done: acc={metrics['accuracy']:.4f}, "
         f"f1={metrics['f1_score']:.4f}"
+        + (f", roc_auc={metrics['roc_auc']:.4f}" if metrics.get("roc_auc") is not None else "")
     )
 
     top_words = {"fake": [], "real": []}
