@@ -98,21 +98,61 @@ def _compute_social_aggregates_per_article(
             if uid:
                 user_lookup[uid] = row
 
+    # ── Tweet engagement lookup ──
+    # tweets.csv не містить retweet_count/reply_count, тож обчислюємо їх
+    # один раз через groupby по retweets.csv / replies.csv.
+    tweet_engagement_lookup: dict[str, dict[str, int]] = {}
+    if len(retweets_df) > 0 and "original_tweet_id" in retweets_df.columns:
+        rt_clean = retweets_df.dropna(subset=["original_tweet_id"])
+        rt_counts = rt_clean.groupby(
+            rt_clean["original_tweet_id"].astype(str)
+        ).size()
+        for tid, count in rt_counts.items():
+            tweet_engagement_lookup[tid] = {"retweets": int(count), "replies": 0}
+
+    if len(replies_df) > 0 and "parent_tweet_id" in replies_df.columns:
+        rep_clean = replies_df.dropna(subset=["parent_tweet_id"])
+        rep_counts = rep_clean.groupby(
+            rep_clean["parent_tweet_id"].astype(str)
+        ).size()
+        for tid, count in rep_counts.items():
+            entry = tweet_engagement_lookup.get(tid)
+            if entry is None:
+                tweet_engagement_lookup[tid] = {
+                    "retweets": 0, "replies": int(count),
+                }
+            else:
+                entry["replies"] = int(count)
+
+    log.info(
+        f"  Built engagement lookup: {len(tweet_engagement_lookup):,} tweets"
+    )
+
     pure_social = [
         f for f in social_features
         if f in SOCIAL_FEATURES and f not in _GRAPH_FEAT_NAMES
     ]
 
+    # ── Pre-compute: groupby один раз (O(N+M) замість O(N*M)) ──
+    if len(tweets_df) > 0 and "article_id" in tweets_df.columns:
+        aid_keys = tweets_df["article_id"].astype(str)
+        tweets_by_article = dict(tuple(tweets_df.groupby(aid_keys)))
+    else:
+        tweets_by_article = {}
+
     rows = []
     for aid in article_ids:
         aid_str = str(aid)
-        article_tweets = tweets_df[tweets_df["article_id"].astype(str) == aid_str]
+        article_tweets = tweets_by_article.get(aid_str, pd.DataFrame())
 
         feat_accum = {f: [] for f in pure_social}
         for _, twt in article_tweets.iterrows():
             uid = str(twt.get("user_id", ""))
             user_row = user_lookup.get(uid)
-            feats = extract_social_features(user_row, pure_social, tweet_row=twt)
+            feats = extract_social_features(
+                user_row, pure_social, tweet_row=twt,
+                tweet_engagement_lookup=tweet_engagement_lookup,
+            )
             for f, v in feats.items():
                 feat_accum[f].append(v)
 
@@ -130,31 +170,60 @@ def _compute_graph_aggregates_per_article(
     """Returns DataFrame: article_id × graph_feature columns."""
     from ml_server.features import extract_graph_features
 
+    # ── Pre-compute: groupby один раз (O(1) lookup замість full scan) ──
+    if len(tweets_df) > 0 and "article_id" in tweets_df.columns:
+        aid_keys = tweets_df["article_id"].astype(str)
+        tweets_by_article = dict(tuple(tweets_df.groupby(aid_keys)))
+    else:
+        tweets_by_article = {}
+
+    if len(retweets_df) > 0 and "original_tweet_id" in retweets_df.columns:
+        rt_keys = retweets_df["original_tweet_id"].astype(str)
+        retweets_by_orig = dict(tuple(retweets_df.groupby(rt_keys)))
+    else:
+        retweets_by_orig = {}
+
+    if len(replies_df) > 0 and "parent_tweet_id" in replies_df.columns:
+        rep_keys = replies_df["parent_tweet_id"].astype(str)
+        replies_by_parent = dict(tuple(replies_df.groupby(rep_keys)))
+    else:
+        replies_by_parent = {}
+
+    empty = pd.DataFrame()
+
     rows = []
     for aid in article_ids:
         aid_str = str(aid)
-        article_tweets = tweets_df[tweets_df["article_id"].astype(str) == aid_str]
-        tweet_ids_set = set(article_tweets["tweet_id"].astype(str).tolist())
+        article_tweets = tweets_by_article.get(aid_str, empty)
 
+        if len(article_tweets) == 0:
+            tweet_ids_list: list[str] = []
+        else:
+            tweet_ids_list = article_tweets["tweet_id"].astype(str).tolist()
+
+        # Retweets для цих tweet_id
+        rt_parts = [retweets_by_orig[t] for t in tweet_ids_list if t in retweets_by_orig]
         article_retweets = (
-            retweets_df[retweets_df["original_tweet_id"].astype(str).isin(tweet_ids_set)]
-            if len(retweets_df) > 0 else pd.DataFrame()
+            pd.concat(rt_parts, ignore_index=True) if rt_parts else empty
         )
 
-        # Replies можуть посилатися і на tweets, і на інші replies (ланцюжок).
-        # Транзитивне розширення на 1 крок через reply_id.
+        # Replies — прямі діти tweets + транзитивне розширення на 1 крок
+        # через reply_id (replies можуть посилатися на інші replies).
+        rep_parts = [replies_by_parent[t] for t in tweet_ids_list if t in replies_by_parent]
         article_replies = (
-            replies_df[replies_df["parent_tweet_id"].astype(str).isin(tweet_ids_set)]
-            if len(replies_df) > 0 else pd.DataFrame()
+            pd.concat(rep_parts, ignore_index=True) if rep_parts else empty
         )
-        if len(article_replies) > 0:
-            initial_reply_ids = set(article_replies["reply_id"].astype(str).tolist())
-            extra_replies = replies_df[
-                replies_df["parent_tweet_id"].astype(str).isin(initial_reply_ids)
+        if len(article_replies) > 0 and "reply_id" in article_replies.columns:
+            initial_reply_ids = article_replies["reply_id"].astype(str).tolist()
+            extra_parts = [
+                replies_by_parent[r]
+                for r in initial_reply_ids
+                if r in replies_by_parent
             ]
-            article_replies = pd.concat(
-                [article_replies, extra_replies], ignore_index=True,
-            )
+            if extra_parts:
+                article_replies = pd.concat(
+                    [article_replies] + extra_parts, ignore_index=True,
+                )
 
         feats = extract_graph_features(
             aid_str, article_tweets, article_retweets, article_replies, graph_features,

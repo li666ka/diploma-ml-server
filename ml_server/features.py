@@ -195,7 +195,10 @@ _REFERENCE_YEAR_UTC = 1577836800.0  # 2020-01-01 UTC (FakeNewsNet cutoff era)
 _MAX_ACCOUNT_AGE_YEARS = 15.0
 
 
-def extract_social_features(user_row, feature_names, tweet_row=None):
+def extract_social_features(
+    user_row, feature_names, tweet_row=None,
+    tweet_engagement_lookup=None,
+):
     """
     Compute social features.
 
@@ -203,6 +206,10 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
         user_row: dict/Series з колонками users.csv (можна None)
         feature_names: list of features to compute
         tweet_row: dict/Series з tweet (для engagement features). Може бути None.
+        tweet_engagement_lookup: dict {tweet_id_str: {"retweets": int, "replies": int}}.
+            Якщо None — retweets/replies вважаються 0 (tweets.csv не містить
+            колонок retweet_count/reply_count, тож їх треба обчислювати
+            заздалегідь з retweets.csv/replies.csv).
 
     Returns: dict {feature_name: float}
     """
@@ -252,8 +259,22 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
 
     # ── Engagement features (від tweet_row, не залежать від user profile) ──
     likes = _num(tweet_row, "like_count", 0)
-    retweets = _num(tweet_row, "retweet_count", 0)
-    replies = _num(tweet_row, "reply_count", 0)
+    retweets = 0
+    replies = 0
+    if tweet_engagement_lookup is not None and tweet_row is not None:
+        try:
+            tid_raw = (
+                tweet_row.get("tweet_id", "")
+                if hasattr(tweet_row, "get")
+                else tweet_row["tweet_id"]
+            )
+        except (KeyError, TypeError):
+            tid_raw = ""
+        tid = str(tid_raw) if tid_raw is not None else ""
+        eng = tweet_engagement_lookup.get(tid)
+        if eng:
+            retweets = eng.get("retweets", 0)
+            replies = eng.get("replies", 0)
 
     if "like_count_norm" in feature_names:
         # log1p(450) ≈ 6.1; нормалізація на 7
@@ -406,9 +427,31 @@ def extract_graph_features(
             (retweets_df, "retweet_created_at"),
             (replies_df, "reply_created_at"),
         ]:
-            if col in df.columns:
-                ts = pd.to_numeric(df[col], errors="coerce").dropna()
-                timestamps.extend(ts.tolist())
+            if col not in df.columns:
+                continue
+            raw = df[col].dropna()
+            if len(raw) == 0:
+                continue
+            # Try numeric first (Unix seconds)
+            ts_numeric = pd.to_numeric(raw, errors="coerce")
+            # Для не-числових значень — пробуємо парсити як datetime string
+            # (Twitter API: "Sun May 25 08:06:04 +0000 2014").
+            mask_failed = ts_numeric.isna()
+            if mask_failed.any():
+                try:
+                    ts_datetime = pd.to_datetime(
+                        raw[mask_failed], errors="coerce", utc=True,
+                    )
+                    valid_dt = ts_datetime.dropna()
+                    if len(valid_dt) > 0:
+                        ts_unix = (
+                            valid_dt.astype("int64") // 10**9
+                        ).astype("float64")
+                        ts_numeric.loc[ts_unix.index] = ts_unix
+                except (ValueError, TypeError):
+                    pass
+            ts_numeric = ts_numeric.dropna()
+            timestamps.extend(ts_numeric.tolist())
         if len(timestamps) >= 2:
             lifetime_seconds = max(timestamps) - min(timestamps)
             lifetime_hours = lifetime_seconds / 3600.0
@@ -434,10 +477,11 @@ def _compute_cascade_topology(tweets_df, replies_df, max_depth=10):
     if len(tweets_df) == 0:
         return 0, 0
 
-    # Tweets — рівень 0 (корені)
+    # Tweets — рівень 0 (корені). max_breadth вимірює РОЗШИРЕННЯ дерева
+    # replies (max replies per level), а не кількість коренів.
     current_level_ids = set(tweets_df["tweet_id"].astype(str).tolist())
     max_depth_reached = 0
-    max_breadth = len(current_level_ids)
+    max_breadth = 0
 
     if len(replies_df) == 0 or "parent_tweet_id" not in replies_df.columns:
         return max_depth_reached, max_breadth
@@ -529,6 +573,7 @@ def extract_features(
     article_retweets_df=None,
     article_replies_df=None,
     article_id=None,
+    tweet_engagement_lookup=None,
 ):
     """
     Dispatch features to correct computation function.
@@ -564,7 +609,10 @@ def extract_features(
         result.update(extract_rhetorical_features(text, rhet_feats_pure))
 
     if soc_feats:
-        result.update(extract_social_features(user_row, soc_feats, tweet_row=tweet_row))
+        result.update(extract_social_features(
+            user_row, soc_feats, tweet_row=tweet_row,
+            tweet_engagement_lookup=tweet_engagement_lookup,
+        ))
 
     if graph_feats and article_tweets_df is not None:
         result.update(extract_graph_features(
