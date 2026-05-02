@@ -15,7 +15,7 @@ from ml_server.distilbert_trainer import (
 )
 from ml_server.features import (
     EMOTIONAL_FEATURES,
-    RHETORICAL_FEATURES,
+    SOCIAL_FEATURES,
     STYLISTIC_FEATURES,
 )
 from ml_server.gnn_trainer import train_gnn
@@ -28,6 +28,12 @@ from ml_server.upload_handlers import (
     list_splits,
 )
 from ml_server.utils import log, preprocess_text
+
+
+# legacy `train_nb_aggregated` приймає stylistic і rhetorical окремо;
+# після об'єднання у STYLISTIC_FEATURES розділяємо їх локально для роутера.
+_STYLISTIC_PURE = {"caps_ratio", "ttr", "repetition_score", "avg_word_length"}
+_RHETORICAL_PURE = {"clickbait_score", "authority_refs", "pronoun_ratio", "question_count"}
 
 
 # ── Async jobs registry ───────────────────────────────────────────────────
@@ -365,7 +371,15 @@ def _run_training_impl(payload: dict) -> dict:
     try:
         # ── Branch 1: NB — article-level (DEFAULT, apples-to-apples) ──
         if model_type == "nb":
-            train_df, val_df, test_df, _, data_stats, tmpdir = (
+            # Витягти additional features з payload
+            additional = model_params.get("additional_features", {}) or {}
+            mask = additional.get("mask", {}) or {}
+            enabled_features = [k for k, v in mask.items() if v]
+
+            # Якщо є social/graph features — потрібен full_data
+            needs_social = any(f in SOCIAL_FEATURES for f in enabled_features)
+
+            train_df, val_df, test_df, full_data, data_stats, tmpdir = (
                 build_article_level_data(
                     dataset_id=dataset_id, dataset_name=dataset_name,
                     test_ratio=float(data_params.get("test_ratio", 0.15)),
@@ -373,6 +387,7 @@ def _run_training_impl(payload: dict) -> dict:
                     min_text_length=int(data_params.get("min_text_length", 30)),
                     seed=int(data_params.get("seed", 42)),
                     require_tweets=False,
+                    require_social=needs_social,
                     splits_subdir=splits_subdir,
                 )
             )
@@ -389,6 +404,8 @@ def _run_training_impl(payload: dict) -> dict:
                 alpha=alpha_val,
                 tfidf_max_features=int(model_params.get("tfidf_max_features", 50000)),
                 preprocessing=preprocessing,
+                additional_features=enabled_features,
+                full_data=full_data,
             )
             result["data_stats"] = data_stats
 
@@ -407,8 +424,8 @@ def _run_training_impl(payload: dict) -> dict:
             mask = additional.get("mask", {}) or {}
             enabled = [k for k, v in mask.items() if v]
             emotional_features = [f for f in enabled if f in EMOTIONAL_FEATURES]
-            stylistic_features = [f for f in enabled if f in STYLISTIC_FEATURES]
-            rhetorical_features = [f for f in enabled if f in RHETORICAL_FEATURES]
+            stylistic_features = [f for f in enabled if f in _STYLISTIC_PURE]
+            rhetorical_features = [f for f in enabled if f in _RHETORICAL_PURE]
             social_features = list(additional.get("social_extra", []) or [])
 
             result = train_nb_aggregated(

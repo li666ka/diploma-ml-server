@@ -53,6 +53,51 @@ def test_train_nb_signature():
     print("✓ train_nb article-level signature OK; train_nb_aggregated preserved")
 
 
+def test_feature_groups():
+    """STYLISTIC об'єднано з RHETORICAL; SOCIAL очищено + додано graph."""
+    from ml_server.features import (
+        EMOTIONAL_FEATURES, SOCIAL_FEATURES, STYLISTIC_FEATURES,
+    )
+
+    assert len(STYLISTIC_FEATURES) == 8, (
+        f"STYLISTIC має містити 8 features (4 styl + 4 rhet), got {len(STYLISTIC_FEATURES)}"
+    )
+    assert "clickbait_score" in STYLISTIC_FEATURES
+    assert "caps_ratio" in STYLISTIC_FEATURES
+
+    # Прибрані social features
+    for removed in ("has_profile", "favourites_count_norm",
+                    "listed_count_norm", "geo_enabled"):
+        assert removed not in SOCIAL_FEATURES, (
+            f"{removed} мав бути прибраний з SOCIAL_FEATURES"
+        )
+
+    # Додані graph features
+    for added in ("cascade_depth_norm", "cascade_breadth_norm",
+                  "lifetime_hours_norm", "retweets_per_tweet",
+                  "replies_per_tweet", "unique_users_norm"):
+        assert added in SOCIAL_FEATURES, (
+            f"{added} має бути в SOCIAL_FEATURES"
+        )
+
+    assert len(EMOTIONAL_FEATURES) == 14
+    print(f"✓ Feature groups OK: emo={len(EMOTIONAL_FEATURES)}, "
+          f"styl={len(STYLISTIC_FEATURES)}, soc={len(SOCIAL_FEATURES)}")
+
+
+def test_train_nb_features_signature():
+    """train_nb має приймати additional_features і full_data."""
+    import inspect
+    from ml_server.nb_trainer import train_nb
+
+    sig = inspect.signature(train_nb)
+    assert "additional_features" in sig.parameters
+    assert "full_data" in sig.parameters
+    assert sig.parameters["additional_features"].default is None
+    assert sig.parameters["full_data"].default is None
+    print("✓ train_nb приймає additional_features + full_data")
+
+
 def test_app_factory():
     from ml_server.app import create_app
     app = create_app()
@@ -82,5 +127,7 @@ if __name__ == "__main__":
     test_imports()
     test_config()
     test_train_nb_signature()
+    test_feature_groups()
+    test_train_nb_features_signature()
     test_app_factory()
     print("\n✅ All smoke tests passed")

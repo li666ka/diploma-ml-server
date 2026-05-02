@@ -1,9 +1,11 @@
 # 4. NRC lexicon loader + emotional feature extraction
-import pandas as pd
-import re
-import emoji
-from collections import defaultdict
+import math
 import os
+import re
+from collections import defaultdict
+
+import emoji
+import pandas as pd
 
 
 def load_nrc_el(path):
@@ -87,25 +89,27 @@ EMOTIONAL_FEATURES = {
 }
 
 STYLISTIC_FEATURES = {
+    # Stylistic (form)
     "caps_ratio", "ttr", "repetition_score", "avg_word_length",
-}
-
-RHETORICAL_FEATURES = {
+    # Rhetorical (manipulation patterns) — раніше окрема група
     "clickbait_score", "authority_refs", "pronoun_ratio", "question_count",
 }
 
 SOCIAL_FEATURES = {
-    # Profile counts (8)
+    # Profile counts (5)
     "followers_count_norm", "friends_count_norm", "ff_ratio",
-    "statuses_count_norm", "favourites_count_norm", "listed_count_norm",
+    "statuses_count_norm",
     "account_age_norm", "statuses_per_day",
-    # Profile flags + strings (8)
-    "verified", "geo_enabled", "has_profile",
+    # Profile flags + strings (5)
+    "verified",
     "has_description", "has_location",
     "description_length_norm", "screen_name_length_norm", "screen_name_digits_ratio",
     # Engagement (5)
     "like_count_norm", "retweet_count_norm", "reply_count_norm",
     "like_to_retweet_ratio", "engagement_rate",
+    # Graph cascade (6) — обчислюються з tweets/retweets/replies для article
+    "cascade_depth_norm", "cascade_breadth_norm", "lifetime_hours_norm",
+    "retweets_per_tweet", "replies_per_tweet", "unique_users_norm",
 }
 
 # Keyword lists for rhetorical features
@@ -246,9 +250,6 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
     followers = _num(user_row, "user_followers_count", -1) if user_row is not None else -1
     has_real_profile = followers >= 0
 
-    if "has_profile" in feature_names:
-        result["has_profile"] = 1.0 if has_real_profile else 0.0
-
     # ── Engagement features (від tweet_row, не залежать від user profile) ──
     likes = _num(tweet_row, "like_count", 0)
     retweets = _num(tweet_row, "retweet_count", 0)
@@ -285,8 +286,6 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
 
     friends = _num(user_row, "user_friends_count")
     statuses = _num(user_row, "user_statuses_count")
-    favourites = _num(user_row, "user_favourites_count")
-    listed = _num(user_row, "user_listed_count")
     created_at = _num(user_row, "user_created_at")
     description = _str(user_row, "user_description")
     location = _str(user_row, "user_location")
@@ -305,12 +304,6 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
 
     if "statuses_count_norm" in feature_names:
         result["statuses_count_norm"] = min(math.log1p(statuses) / 20.0, 1.0)
-
-    if "favourites_count_norm" in feature_names:
-        result["favourites_count_norm"] = min(math.log1p(favourites) / 20.0, 1.0)
-
-    if "listed_count_norm" in feature_names:
-        result["listed_count_norm"] = min(math.log1p(listed) / 15.0, 1.0)
 
     # Account age + activity rate
     REFERENCE_UNIX = 1577836800.0  # 2020-01-01
@@ -333,9 +326,6 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
     # Booleans
     if "verified" in feature_names:
         result["verified"] = _bool(user_row, "user_verified")
-
-    if "geo_enabled" in feature_names:
-        result["geo_enabled"] = _bool(user_row, "user_geo_enabled")
 
     if "has_description" in feature_names:
         result["has_description"] = 1.0 if description.strip() else 0.0
@@ -363,8 +353,125 @@ def extract_social_features(user_row, feature_names, tweet_row=None):
     return result
 
 
-import math  # required by extract_social_features
-print("✓ Social features: 21 фіч (8 counts + 8 flags/strings + 5 engagement)")
+print("✓ Social features: 23 фіч (6 counts + 6 flags/strings + 5 engagement + 6 graph)")
+
+
+# ── Graph cascade features (per-article) ──────────────────────────────────
+
+def extract_graph_features(
+    article_id,
+    tweets_df,       # subset де article_id == this article
+    retweets_df,     # subset де original_tweet_id IN tweets_df.tweet_id
+    replies_df,      # subset де parent_tweet_id IN tweets_df.tweet_id (transitive)
+    feature_names,
+):
+    """Compute graph cascade features for one article.
+
+    Очікує df-и які вже відфільтровані для цієї статті.
+    """
+    result = {f: 0.0 for f in feature_names}
+
+    n_tweets = len(tweets_df)
+    n_retweets = len(retweets_df)
+    n_replies = len(replies_df)
+
+    if n_tweets == 0:
+        return result  # Без твітів — все 0
+
+    # ── retweets_per_tweet, replies_per_tweet ──
+    if "retweets_per_tweet" in feature_names:
+        ratio = n_retweets / max(n_tweets, 1)
+        result["retweets_per_tweet"] = min(ratio, 50.0) / 50.0
+
+    if "replies_per_tweet" in feature_names:
+        ratio = n_replies / max(n_tweets, 1)
+        result["replies_per_tweet"] = min(ratio, 50.0) / 50.0
+
+    # ── unique_users_norm ──
+    if "unique_users_norm" in feature_names:
+        users = set()
+        if "user_id" in tweets_df.columns:
+            users.update(tweets_df["user_id"].dropna().astype(str).tolist())
+        if "user_id" in retweets_df.columns:
+            users.update(retweets_df["user_id"].dropna().astype(str).tolist())
+        if "user_id" in replies_df.columns:
+            users.update(replies_df["user_id"].dropna().astype(str).tolist())
+        result["unique_users_norm"] = min(math.log1p(len(users)) / 10.0, 1.0)
+
+    # ── lifetime_hours_norm ──
+    if "lifetime_hours_norm" in feature_names:
+        timestamps = []
+        for df, col in [
+            (tweets_df, "tweet_created_at"),
+            (retweets_df, "retweet_created_at"),
+            (replies_df, "reply_created_at"),
+        ]:
+            if col in df.columns:
+                ts = pd.to_numeric(df[col], errors="coerce").dropna()
+                timestamps.extend(ts.tolist())
+        if len(timestamps) >= 2:
+            lifetime_seconds = max(timestamps) - min(timestamps)
+            lifetime_hours = lifetime_seconds / 3600.0
+            # 30 days = 720h як максимум
+            result["lifetime_hours_norm"] = min(lifetime_hours / 720.0, 1.0)
+
+    # ── cascade_depth_norm: BFS глибина reply tree ──
+    # ── cascade_breadth_norm: max ширина на одному рівні ──
+    if "cascade_depth_norm" in feature_names or "cascade_breadth_norm" in feature_names:
+        depth, breadth = _compute_cascade_topology(
+            tweets_df, replies_df, max_depth=10
+        )
+        if "cascade_depth_norm" in feature_names:
+            result["cascade_depth_norm"] = min(depth / 10.0, 1.0)
+        if "cascade_breadth_norm" in feature_names:
+            result["cascade_breadth_norm"] = min(breadth / 20.0, 1.0)
+
+    return result
+
+
+def _compute_cascade_topology(tweets_df, replies_df, max_depth=10):
+    """Returns (max_depth, max_breadth) reply tree."""
+    if len(tweets_df) == 0:
+        return 0, 0
+
+    # Tweets — рівень 0 (корені)
+    current_level_ids = set(tweets_df["tweet_id"].astype(str).tolist())
+    max_depth_reached = 0
+    max_breadth = len(current_level_ids)
+
+    if len(replies_df) == 0 or "parent_tweet_id" not in replies_df.columns:
+        return max_depth_reached, max_breadth
+
+    # Build children lookup
+    replies_df_clean = replies_df.copy()
+    replies_df_clean["parent_tweet_id"] = replies_df_clean["parent_tweet_id"].astype(str)
+    replies_df_clean["reply_id"] = replies_df_clean["reply_id"].astype(str)
+
+    children_of = {}
+    for parent_id, group in replies_df_clean.groupby("parent_tweet_id"):
+        children_of[parent_id] = group["reply_id"].tolist()
+
+    visited = set(current_level_ids)
+
+    for depth in range(1, max_depth + 1):
+        next_level = []
+        for parent in current_level_ids:
+            kids = children_of.get(parent, [])
+            for kid in kids:
+                if kid not in visited:
+                    visited.add(kid)
+                    next_level.append(kid)
+        if not next_level:
+            break
+        max_depth_reached = depth
+        max_breadth = max(max_breadth, len(next_level))
+        current_level_ids = set(next_level)
+
+    return max_depth_reached, max_breadth
+
+
+print("✓ Graph features: cascade_depth_norm, cascade_breadth_norm, lifetime_hours_norm, "
+      "retweets_per_tweet, replies_per_tweet, unique_users_norm")
 
 def _extract_emotional(text, nrc_el, nrc_eil, feature_list):
     if not isinstance(text, str) or not text.strip():
@@ -414,40 +521,56 @@ def _extract_emotional(text, nrc_el, nrc_eil, feature_list):
     return results
 
 
-def extract_features(text, nrc_el, nrc_eil, feature_names, user_row=None):
+def extract_features(
+    text, nrc_el, nrc_eil, feature_names,
+    user_row=None,
+    tweet_row=None,
+    article_tweets_df=None,
+    article_retweets_df=None,
+    article_replies_df=None,
+    article_id=None,
+):
     """
     Dispatch features to correct computation function.
 
     Routes by feature name:
     - Emotional (14)  → NRC lookup via _extract_emotional (from text)
-    - Stylistic (4)   → stylistic computation (from text)
-    - Rhetorical (4)  → manipulation patterns (from text)
-    - Social (9)      → from user_row (NOT from text) — required user profile
-
-    Args:
-        text: the tweet text (for text-based features)
-        user_row: user profile row (dict/Series) for social features (optional)
+    - Stylistic (8)   → stylistic + rhetorical (from text)
+    - Social  (13)    → from user_row + tweet_row (NOT from text)
+    - Graph    (6)    → from article_*_df (cascade topology)
     """
     emo_feats = [f for f in feature_names if f in EMOTIONAL_FEATURES]
-    styl_feats = [f for f in feature_names if f in STYLISTIC_FEATURES]
-    rhet_feats = [f for f in feature_names if f in RHETORICAL_FEATURES]
-    soc_feats = [f for f in feature_names if f in SOCIAL_FEATURES]
+    # styl тепер містить і чисто стилістичні, і риторичні
+    styl_pure = {"caps_ratio", "ttr", "repetition_score", "avg_word_length"}
+    rhet_pure = {"clickbait_score", "authority_refs", "pronoun_ratio", "question_count"}
+    graph_pure = {
+        "cascade_depth_norm", "cascade_breadth_norm", "lifetime_hours_norm",
+        "retweets_per_tweet", "replies_per_tweet", "unique_users_norm",
+    }
+    styl_feats_pure = [f for f in feature_names if f in styl_pure]
+    rhet_feats_pure = [f for f in feature_names if f in rhet_pure]
+    graph_feats = [f for f in feature_names if f in graph_pure]
+    soc_feats = [f for f in feature_names if f in SOCIAL_FEATURES and f not in graph_pure]
 
     result = {}
 
     if emo_feats:
         result.update(_extract_emotional(text, nrc_el, nrc_eil, emo_feats))
 
-    if styl_feats:
-        result.update(extract_stylistic_features(text, styl_feats))
+    if styl_feats_pure:
+        result.update(extract_stylistic_features(text, styl_feats_pure))
 
-    if rhet_feats:
-        result.update(extract_rhetorical_features(text, rhet_feats))
+    if rhet_feats_pure:
+        result.update(extract_rhetorical_features(text, rhet_feats_pure))
 
     if soc_feats:
-        # tweet_row passed via user_row's parent context (handled by caller)
-        # extract_features signature stays same — caller may include tweet_row in user_row
-        result.update(extract_social_features(user_row, soc_feats, tweet_row=user_row))
+        result.update(extract_social_features(user_row, soc_feats, tweet_row=tweet_row))
+
+    if graph_feats and article_tweets_df is not None:
+        result.update(extract_graph_features(
+            article_id, article_tweets_df, article_retweets_df,
+            article_replies_df, graph_feats,
+        ))
 
     # Fill missing (if caller asked for something unknown)
     for f in feature_names:

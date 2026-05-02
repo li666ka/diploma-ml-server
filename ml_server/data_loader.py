@@ -126,6 +126,7 @@ def build_article_level_data(
     min_text_length: int = 30,
     seed: int = 42,
     require_tweets: bool = False,
+    require_social: bool = False,
     splits_subdir: Optional[str] = None,
 ):
     """
@@ -195,9 +196,9 @@ def build_article_level_data(
     log.info(f"  Test:  {len(test_df):,} (FAKE={(test_df.label==1).sum():,}, "
              f"REAL={(test_df.label==0).sum():,})")
 
-    # ── Optional: tweets/retweets/replies/users (для GNN) ──
+    # ── Optional: tweets/retweets/replies/users (для GNN та NB+social) ──
     full_data = None
-    if require_tweets:
+    if require_tweets or require_social:
         full_data = _load_social_data(csv_dir)
 
     stats = {
@@ -213,6 +214,7 @@ def build_article_level_data(
         "test_fake": int((test_df.label == 1).sum()),
         "test_real": int((test_df.label == 0).sum()),
         "splits_used": splits_used,
+        "has_full_data": full_data is not None,
     }
 
     return train_df, val_df, test_df, full_data, stats, tmpdir

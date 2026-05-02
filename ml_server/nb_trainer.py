@@ -72,6 +72,99 @@ def _extract_top_words(pipeline: Pipeline, vec_step: str = "vectorizer",
     return top_words
 
 
+# ── Per-article social/graph aggregation (для article-level NB) ──────────
+
+# Graph features обчислюються окремо (per-article cascade); решта SOCIAL_FEATURES
+# усереднюється по всіх твітах статті.
+_GRAPH_FEAT_NAMES = {
+    "cascade_depth_norm", "cascade_breadth_norm", "lifetime_hours_norm",
+    "retweets_per_tweet", "replies_per_tweet", "unique_users_norm",
+}
+
+
+def _compute_social_aggregates_per_article(
+    article_ids, tweets_df, retweets_df, replies_df, users_df, social_features,
+):
+    """Returns DataFrame: article_id × social_feature columns.
+    Усереднює social features по всіх твітах статті (Variant A).
+    """
+    from ml_server.features import SOCIAL_FEATURES, extract_social_features
+
+    # Build user_id → user_row dict
+    user_lookup = {}
+    if users_df is not None and len(users_df) > 0:
+        for _, row in users_df.iterrows():
+            uid = str(row.get("user_id", ""))
+            if uid:
+                user_lookup[uid] = row
+
+    pure_social = [
+        f for f in social_features
+        if f in SOCIAL_FEATURES and f not in _GRAPH_FEAT_NAMES
+    ]
+
+    rows = []
+    for aid in article_ids:
+        aid_str = str(aid)
+        article_tweets = tweets_df[tweets_df["article_id"].astype(str) == aid_str]
+
+        feat_accum = {f: [] for f in pure_social}
+        for _, twt in article_tweets.iterrows():
+            uid = str(twt.get("user_id", ""))
+            user_row = user_lookup.get(uid)
+            feats = extract_social_features(user_row, pure_social, tweet_row=twt)
+            for f, v in feats.items():
+                feat_accum[f].append(v)
+
+        article_feats = {"article_id": aid_str}
+        for f, vals in feat_accum.items():
+            article_feats[f] = float(np.mean(vals)) if vals else 0.0
+        rows.append(article_feats)
+
+    return pd.DataFrame(rows)
+
+
+def _compute_graph_aggregates_per_article(
+    article_ids, tweets_df, retweets_df, replies_df, graph_features,
+):
+    """Returns DataFrame: article_id × graph_feature columns."""
+    from ml_server.features import extract_graph_features
+
+    rows = []
+    for aid in article_ids:
+        aid_str = str(aid)
+        article_tweets = tweets_df[tweets_df["article_id"].astype(str) == aid_str]
+        tweet_ids_set = set(article_tweets["tweet_id"].astype(str).tolist())
+
+        article_retweets = (
+            retweets_df[retweets_df["original_tweet_id"].astype(str).isin(tweet_ids_set)]
+            if len(retweets_df) > 0 else pd.DataFrame()
+        )
+
+        # Replies можуть посилатися і на tweets, і на інші replies (ланцюжок).
+        # Транзитивне розширення на 1 крок через reply_id.
+        article_replies = (
+            replies_df[replies_df["parent_tweet_id"].astype(str).isin(tweet_ids_set)]
+            if len(replies_df) > 0 else pd.DataFrame()
+        )
+        if len(article_replies) > 0:
+            initial_reply_ids = set(article_replies["reply_id"].astype(str).tolist())
+            extra_replies = replies_df[
+                replies_df["parent_tweet_id"].astype(str).isin(initial_reply_ids)
+            ]
+            article_replies = pd.concat(
+                [article_replies, extra_replies], ignore_index=True,
+            )
+
+        feats = extract_graph_features(
+            aid_str, article_tweets, article_retweets, article_replies, graph_features,
+        )
+        feats["article_id"] = aid_str
+        rows.append(feats)
+
+    return pd.DataFrame(rows)
+
+
 # ── Article-level NB (DEFAULT) ───────────────────────────────────────────
 
 ALPHA_GRID = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0]
@@ -90,6 +183,8 @@ def train_nb(
     alpha: Optional[float] = None,
     tfidf_max_features: int = 50000,
     preprocessing: Optional[dict] = None,
+    additional_features: Optional[list] = None,
+    full_data: Optional[dict] = None,
 ):
     """Article-level NB на ``combined_text`` (article_title + article_text).
 
@@ -134,16 +229,129 @@ def train_nb(
             lambda t: preprocess_text(t, preprocessing)
         )
 
-    X_train = df_train["text_processed"].values
     y_train = df_train["label"].astype(int).values
-    X_test = df_test["text_processed"].values
     y_test = df_test["label"].astype(int).values
 
     log.info(
         f"train_nb (article-level): variant={nb_variant}, vec={vectorizer_type}, "
-        f"ngrams={ngram_range}, train={len(X_train)}, "
-        f"val={len(df_val) if df_val is not None else 0}, test={len(X_test)}"
+        f"ngrams={ngram_range}, train={len(df_train)}, "
+        f"val={len(df_val) if df_val is not None else 0}, test={len(df_test)}"
     )
+
+    # ── Additional features (опційно) ──
+    add_feat_cols: list[str] = []
+    if additional_features:
+        log.info(f"Processing additional features: {additional_features}")
+
+        from ml_server.features import (
+            EMOTIONAL_FEATURES, SOCIAL_FEATURES, STYLISTIC_FEATURES,
+            extract_features, nrc_el, nrc_eil,
+        )
+
+        text_feats = [f for f in additional_features
+                      if f in EMOTIONAL_FEATURES or f in STYLISTIC_FEATURES]
+        social_feats_pure = [f for f in additional_features
+                             if f in SOCIAL_FEATURES and f not in _GRAPH_FEAT_NAMES]
+        graph_feats = [f for f in additional_features if f in _GRAPH_FEAT_NAMES]
+
+        log.info(
+            f"  Split: text={len(text_feats)}, social={len(social_feats_pure)}, "
+            f"graph={len(graph_feats)}"
+        )
+
+        df_parts = [df_train, df_test]
+        if df_val is not None:
+            df_parts.insert(1, df_val)
+
+        # Text-based features (per-row)
+        if text_feats:
+            for df_part in df_parts:
+                feats_list = df_part["combined_text"].apply(
+                    lambda t: extract_features(t, nrc_el, nrc_eil, text_feats)
+                )
+                feats_df = pd.DataFrame(feats_list.tolist(), index=df_part.index)
+                for col in feats_df.columns:
+                    df_part[col] = feats_df[col]
+                    if col not in add_feat_cols:
+                        add_feat_cols.append(col)
+
+        # Social/graph features (потребують full_data)
+        if (social_feats_pure or graph_feats) and full_data is not None:
+            tweets_df = full_data.get("tweets", pd.DataFrame())
+            retweets_df = full_data.get("retweets", pd.DataFrame())
+            replies_df = full_data.get("replies", pd.DataFrame())
+            users_df = full_data.get("users", pd.DataFrame())
+
+            for i, df_part in enumerate(df_parts):
+                article_ids = df_part["article_id"].tolist()
+
+                if social_feats_pure:
+                    soc_df = _compute_social_aggregates_per_article(
+                        article_ids, tweets_df, retweets_df, replies_df, users_df,
+                        social_feats_pure,
+                    )
+                    df_part = df_part.merge(soc_df, on="article_id", how="left")
+                    for f in social_feats_pure:
+                        df_part[f] = df_part[f].fillna(0.0)
+                        if f not in add_feat_cols:
+                            add_feat_cols.append(f)
+                    df_parts[i] = df_part
+
+                if graph_feats:
+                    gr_df = _compute_graph_aggregates_per_article(
+                        article_ids, tweets_df, retweets_df, replies_df,
+                        graph_feats,
+                    )
+                    df_part = df_part.merge(gr_df, on="article_id", how="left")
+                    for f in graph_feats:
+                        df_part[f] = df_part[f].fillna(0.0)
+                        if f not in add_feat_cols:
+                            add_feat_cols.append(f)
+                    df_parts[i] = df_part
+
+            # Re-bind після merge (merge створює нові DataFrame)
+            df_train = df_parts[0]
+            if df_val is not None:
+                df_val = df_parts[1]
+                df_test = df_parts[2]
+            else:
+                df_test = df_parts[1]
+        elif social_feats_pure or graph_feats:
+            log.warning(
+                "Social/graph features requested але full_data=None. "
+                "Пропускаю social/graph (text features залишаються)."
+            )
+
+    # ── Pipeline builder ──
+    use_features = bool(add_feat_cols)
+
+    def _make_pipeline(a):
+        """Build pipeline for given alpha. With or without additional features."""
+        if use_features:
+            transformers = [
+                ("text_vec",
+                 get_vectorizer(vectorizer_type, ngram_range, tfidf_max_features),
+                 "text_processed"),
+                ("num_scaler", MinMaxScaler(), add_feat_cols),
+            ]
+            return Pipeline([
+                ("preprocessor", ColumnTransformer(transformers=transformers)),
+                ("classifier", get_nb_classifier(nb_variant, a)),
+            ])
+        return Pipeline([
+            ("vectorizer", get_vectorizer(
+                vectorizer_type, ngram_range, tfidf_max_features
+            )),
+            ("classifier", get_nb_classifier(nb_variant, a)),
+        ])
+
+    def _make_X(df_part):
+        if use_features:
+            return df_part[["text_processed"] + add_feat_cols]
+        return df_part["text_processed"].values
+
+    X_train = _make_X(df_train)
+    X_test = _make_X(df_test)
 
     # ── Alpha selection ──
     alpha_search: list[dict] = []
@@ -156,18 +364,13 @@ def train_nb(
         chosen_alpha = 1.0
         log.warning("  no val_df provided — defaulting alpha=1.0 (no tuning)")
     else:
-        X_val = df_val["text_processed"].values
+        X_val = _make_X(df_val)
         y_val = df_val["label"].astype(int).values
         log.info(f"  Auto-tuning alpha across {ALPHA_GRID} on val set...")
         chosen_alpha = ALPHA_GRID[0]
         best_val_f1 = -1.0
         for a in ALPHA_GRID:
-            pipe = Pipeline([
-                ("vectorizer", get_vectorizer(
-                    vectorizer_type, ngram_range, tfidf_max_features
-                )),
-                ("classifier", get_nb_classifier(nb_variant, a)),
-            ])
+            pipe = _make_pipeline(a)
             pipe.fit(X_train, y_train)
             y_val_pred = pipe.predict(X_val)
             from sklearn.metrics import f1_score
@@ -180,12 +383,7 @@ def train_nb(
         log.info(f"  ✓ Best alpha={chosen_alpha} (val_f1_macro={best_val_f1:.4f})")
 
     # ── Final training on train (з обраним alpha) ──
-    pipeline = Pipeline([
-        ("vectorizer", get_vectorizer(
-            vectorizer_type, ngram_range, tfidf_max_features
-        )),
-        ("classifier", get_nb_classifier(nb_variant, chosen_alpha)),
-    ])
+    pipeline = _make_pipeline(chosen_alpha)
 
     t0 = time.time()
     pipeline.fit(X_train, y_train)
@@ -201,7 +399,8 @@ def train_nb(
         y_proba = None
 
     metrics = compute_metrics(y_test, y_pred, elapsed, y_proba=y_proba)
-    metrics["train_size"] = len(X_train)
+    metrics["train_size"] = len(df_train)
+    metrics["additional_features_used"] = list(add_feat_cols)
     if best_val_f1 is not None:
         metrics["val_f1_macro"] = round(float(best_val_f1), 4)
 
@@ -211,7 +410,31 @@ def train_nb(
         + (f", roc_auc={metrics['roc_auc']:.4f}" if metrics.get("roc_auc") is not None else "")
     )
 
-    top_words = _extract_top_words(pipeline)
+    # top_words: для ColumnTransformer-based pipeline vectorizer лежить інакше.
+    if use_features:
+        top_words = {"fake": [], "real": []}
+        try:
+            preproc = pipeline.named_steps["preprocessor"]
+            text_vec = preproc.named_transformers_["text_vec"]
+            clf = pipeline.named_steps["classifier"]
+            vocab = text_vec.get_feature_names_out()
+            log_prob = clf.feature_log_prob_
+            n_text = len(vocab)
+            if log_prob.shape[1] >= n_text:
+                diff = log_prob[1, :n_text] - log_prob[0, :n_text]
+                top_n = 20
+                fake_idx = diff.argsort()[-top_n:][::-1]
+                real_idx = diff.argsort()[:top_n]
+                top_words["fake"] = [
+                    {"word": vocab[i], "score": float(diff[i])} for i in fake_idx
+                ]
+                top_words["real"] = [
+                    {"word": vocab[i], "score": float(-diff[i])} for i in real_idx
+                ]
+        except Exception as e:
+            log.warning(f"top words extraction (with features) failed: {e}")
+    else:
+        top_words = _extract_top_words(pipeline)
 
     save_path = (
         f"/content/drive/MyDrive/diploma_models/user_{user_id}/"
@@ -229,6 +452,7 @@ def train_nb(
         "alpha": float(chosen_alpha),
         "alpha_search": alpha_search,
         "tfidf_max_features": tfidf_max_features,
+        "additional_features": list(additional_features) if additional_features else [],
     }
     joblib.dump(bundle, save_path)
     log.info(f"  Saved article-level NB → {save_path}")
