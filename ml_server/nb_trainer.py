@@ -140,9 +140,17 @@ def _compute_social_aggregates_per_article(
     else:
         tweets_by_article = {}
 
-    rows = []
+    # Дедупліковані article_ids — інакше merge створить cartesian product.
+    unique_aids: list[str] = []
+    seen_aids: set[str] = set()
     for aid in article_ids:
         aid_str = str(aid)
+        if aid_str not in seen_aids:
+            seen_aids.add(aid_str)
+            unique_aids.append(aid_str)
+
+    rows = []
+    for aid_str in unique_aids:
         article_tweets = tweets_by_article.get(aid_str, pd.DataFrame())
 
         feat_accum = {f: [] for f in pure_social}
@@ -191,9 +199,17 @@ def _compute_graph_aggregates_per_article(
 
     empty = pd.DataFrame()
 
-    rows = []
+    # Дедупліковані article_ids — інакше merge створить cartesian product.
+    unique_aids: list[str] = []
+    seen_aids: set[str] = set()
     for aid in article_ids:
         aid_str = str(aid)
+        if aid_str not in seen_aids:
+            seen_aids.add(aid_str)
+            unique_aids.append(aid_str)
+
+    rows = []
+    for aid_str in unique_aids:
         article_tweets = tweets_by_article.get(aid_str, empty)
 
         if len(article_tweets) == 0:
@@ -310,9 +326,6 @@ def train_nb(
             lambda t: preprocess_text(t, preprocessing)
         )
 
-    y_train = df_train["label"].astype(int).values
-    y_test = df_test["label"].astype(int).values
-
     log.info(
         f"train_nb (article-level): variant={nb_variant}, use_text={use_text}, "
         f"vec={vectorizer_type}, ngrams={ngram_range}, train={len(df_train)}, "
@@ -371,6 +384,11 @@ def train_nb(
                         article_ids, tweets_df, retweets_df, replies_df, users_df,
                         social_feats_pure,
                     )
+                    # Drop колонки з попереднього merge — інакше pandas
+                    # робить _x/_y suffix collisions.
+                    for col in soc_df.columns:
+                        if col != "article_id" and col in df_part.columns:
+                            df_part = df_part.drop(columns=[col])
                     df_part = df_part.merge(soc_df, on="article_id", how="left")
                     for f in social_feats_pure:
                         df_part[f] = df_part[f].fillna(0.0)
@@ -383,6 +401,9 @@ def train_nb(
                         article_ids, tweets_df, retweets_df, replies_df,
                         graph_feats,
                     )
+                    for col in gr_df.columns:
+                        if col != "article_id" and col in df_part.columns:
+                            df_part = df_part.drop(columns=[col])
                     df_part = df_part.merge(gr_df, on="article_id", how="left")
                     for f in graph_feats:
                         df_part[f] = df_part[f].fillna(0.0)
@@ -397,11 +418,41 @@ def train_nb(
                 df_test = df_parts[2]
             else:
                 df_test = df_parts[1]
+
+            # Sanity check: merge на дублі у правому DF створив би cartesian
+            # product → inconsistent N rows між X і y. Дедуплікуємо тут на
+            # випадок якщо щось проскочило.
+            for name, dfx in [
+                ("train", df_train), ("val", df_val), ("test", df_test),
+            ]:
+                if dfx is None:
+                    continue
+                if dfx["article_id"].duplicated().any():
+                    dup_count = int(dfx["article_id"].duplicated().sum())
+                    log.warning(
+                        f"  ⚠️ {name} has {dup_count} duplicate article_ids"
+                        f" after merge — dropping duplicates"
+                    )
+                    deduped = dfx.drop_duplicates(
+                        subset="article_id"
+                    ).reset_index(drop=True)
+                    if name == "train":
+                        df_train = deduped
+                    elif name == "val":
+                        df_val = deduped
+                    else:
+                        df_test = deduped
         elif social_feats_pure or graph_feats:
             log.warning(
                 "Social/graph features requested але full_data=None. "
                 "Пропускаю social/graph (text features залишаються)."
             )
+
+    # y_train/y_test обчислюємо тут (після merge+dedup), щоб довжина
+    # співпадала з X_train/X_test (інакше sklearn кидає
+    # "inconsistent numbers of samples").
+    y_train = df_train["label"].astype(int).values
+    y_test = df_test["label"].astype(int).values
 
     # ── Pipeline builder ──
     use_features = bool(add_feat_cols)
