@@ -216,12 +216,11 @@ def register_routes(app: Flask):
     @app.route("/predict_gnn", methods=["POST"])
     def predict_gnn():
         import joblib
-        import numpy as np
         import torch
-        from torch_geometric.data import Batch, Data
+        import torch.nn.functional as F
 
-        from ml_server.encoder import encode_texts_batch
         from ml_server.gnn_models import build_gnn_model
+        from ml_server.graph_builder import build_inference_graph
 
         data = request.json or {}
         article_text = data.get("article_text", "")
@@ -235,6 +234,23 @@ def register_routes(app: Flask):
         if not model_path or not os.path.exists(model_path):
             return jsonify({"error": f"Model file not found: {model_path}"}), 400
 
+        # Backward-compat: старі клієнти передають {parent_idx, parent_type}.
+        # Нова функція очікує {parent_tweet_idx | parent_reply_idx}.
+        normalized_replies = []
+        for rp in replies_input:
+            if "parent_tweet_idx" in rp or "parent_reply_idx" in rp:
+                normalized_replies.append(rp)
+                continue
+            parent_idx = rp.get("parent_idx")
+            parent_type = rp.get("parent_type", "tweet")
+            new_rp = {"text": rp.get("text", "")}
+            if parent_idx is not None:
+                if parent_type == "reply":
+                    new_rp["parent_reply_idx"] = parent_idx
+                else:
+                    new_rp["parent_tweet_idx"] = parent_idx
+            normalized_replies.append(new_rp)
+
         try:
             meta = joblib.load(model_path)
             if meta.get("type") != "gnn":
@@ -243,75 +259,32 @@ def register_routes(app: Flask):
                 }), 400
 
             architecture = meta["architecture"]
-            in_dim = meta["in_dim"]
-            hidden_dim = meta["hidden_dim"]
-            dropout = meta["dropout"]
             best_model_path = meta["best_model_path"]
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model = build_gnn_model(
-                architecture, in_dim, hidden_dim, dropout
+                architecture=architecture,
+                in_dim=meta["in_dim"],
+                hidden_dim=meta["hidden_dim"],
+                dropout=meta["dropout"],
+                num_layers=meta.get("num_layers", 3),
+                pooling=meta.get("pooling"),
+                aggregator=meta.get("aggregator", "mean"),
             ).to(device)
             model.load_state_dict(torch.load(
                 best_model_path, map_location=device, weights_only=True
             ))
             model.eval()
 
-            # Encode all texts in single batch
-            all_texts = [article_text]
-            all_texts.extend([t.get("text", "") for t in tweets_input])
-            all_texts.extend([rt.get("text", "") for rt in retweets_input])
-            all_texts.extend([rp.get("text", "") for rp in replies_input])
-
-            embs_np = encode_texts_batch(
-                all_texts, batch_size=128, max_chars=2000, show_progress=False
-            )
-            embs = torch.from_numpy(embs_np)
-
-            # Build edge_index
-            edge_src, edge_dst = [], []
-            article_idx = 0
-            n_tweets = len(tweets_input)
-            n_retweets = len(retweets_input)
-
-            tweet_indices = list(range(1, 1 + n_tweets))
-            for tw_idx in tweet_indices:
-                edge_src.append(tw_idx)
-                edge_dst.append(article_idx)
-
-            retweet_indices = list(range(1 + n_tweets, 1 + n_tweets + n_retweets))
-            for i, rt in enumerate(retweets_input):
-                orig_idx = rt.get("original_tweet_idx", 0)
-                if 0 <= orig_idx < n_tweets:
-                    edge_src.append(retweet_indices[i])
-                    edge_dst.append(tweet_indices[orig_idx])
-
-            reply_start = 1 + n_tweets + n_retweets
-            for i, rp in enumerate(replies_input):
-                parent_idx = rp.get("parent_idx", 0)
-                parent_type = rp.get("parent_type", "tweet")
-                rp_node_idx = reply_start + i
-                if parent_type == "tweet" and 0 <= parent_idx < n_tweets:
-                    edge_src.append(rp_node_idx)
-                    edge_dst.append(tweet_indices[parent_idx])
-                elif parent_type == "reply" and 0 <= parent_idx < i:
-                    edge_src.append(rp_node_idx)
-                    edge_dst.append(reply_start + parent_idx)
-
-            if edge_src:
-                edge_index = torch.tensor(
-                    [edge_src + edge_dst, edge_dst + edge_src],
-                    dtype=torch.long,
-                )
-            else:
-                edge_index = torch.empty((2, 0), dtype=torch.long)
-
-            graph_data = Data(x=embs, edge_index=edge_index)
-            batch = Batch.from_data_list([graph_data]).to(device)
+            graph_data = build_inference_graph(
+                article_text=article_text,
+                tweets_input=tweets_input,
+                retweets_input=retweets_input,
+                replies_input=normalized_replies,
+            ).to(device)
 
             with torch.no_grad():
-                import torch.nn.functional as F
-                logits = model(batch)
+                logits = model(graph_data)
                 probs = F.softmax(logits, dim=1)[0].cpu().numpy()
 
             pred = int(probs.argmax())
@@ -329,6 +302,19 @@ def register_routes(app: Flask):
             tb = traceback.format_exc()
             log.error(f"GNN prediction failed: {e}\n{tb}")
             return jsonify({"error": str(e), "traceback": tb}), 500
+
+    @app.route("/embedding_cache/<dataset_id>", methods=["GET"])
+    def get_embedding_cache_route(dataset_id):
+        """Cache info для dataset."""
+        from ml_server.embedding_cache import get_cache_info
+        return jsonify(get_cache_info(dataset_id))
+
+    @app.route("/embedding_cache/<dataset_id>", methods=["DELETE"])
+    def invalidate_embedding_cache_route(dataset_id):
+        """Видалити cache для dataset."""
+        from ml_server.embedding_cache import invalidate_cache
+        success = invalidate_cache(dataset_id)
+        return jsonify({"invalidated": success})
 
     return app
 

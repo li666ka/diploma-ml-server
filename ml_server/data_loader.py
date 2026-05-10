@@ -200,6 +200,8 @@ def build_article_level_data(
     full_data = None
     if require_tweets or require_social:
         full_data = _load_social_data(csv_dir)
+        full_data["dataset_id"] = dataset_id
+        full_data["dataset_folder"] = csv_dir
 
     stats = {
         "mode": "article-level",

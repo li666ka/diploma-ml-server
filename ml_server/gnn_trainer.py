@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from ml_server.config import MODELS_ROOT
-from ml_server.encoder import encode_dataframe_column
+from ml_server.embedding_cache import encode_with_cache
 from ml_server.gnn_models import build_gnn_model
 from ml_server.graph_builder import build_all_graphs
 from ml_server.utils import create_download_url, log
@@ -26,30 +26,43 @@ from ml_server.utils import create_download_url, log
 
 @torch.no_grad()
 def evaluate_gnn(model, loader, device):
-    """Returns (metrics_dict, preds, labels, probs)."""
+    """Returns (metrics_dict, preds, labels, probs). Безпечне для edge cases."""
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
+
     for batch in loader:
         batch = batch.to(device)
         logits = model(batch)
         probs = F.softmax(logits, dim=1)[:, 1]
         preds = logits.argmax(dim=1)
+
+        labels = batch.y
+        if labels.dim() > 1:
+            labels = labels.squeeze(-1)
+
         all_preds.append(preds.cpu())
-        all_labels.append(batch.y.squeeze().cpu())
+        all_labels.append(labels.cpu())
         all_probs.append(probs.cpu())
 
     all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
     all_probs = torch.cat(all_probs).numpy()
 
+    unique_labels = np.unique(all_labels)
+    if len(unique_labels) >= 2:
+        roc_auc = float(roc_auc_score(all_labels, all_probs))
+    else:
+        log.warning(f"ROC-AUC undefined: y_true має тільки клас {unique_labels[0]}")
+        roc_auc = float("nan")
+
     metrics = {
         "accuracy": float(accuracy_score(all_labels, all_preds)),
-        "f1_macro": float(f1_score(all_labels, all_preds, average="macro")),
-        "f1_fake": float(f1_score(all_labels, all_preds, pos_label=1)),
-        "f1_real": float(f1_score(all_labels, all_preds, pos_label=0)),
-        "roc_auc": float(roc_auc_score(all_labels, all_probs)),
+        "f1_macro": float(f1_score(all_labels, all_preds, average="macro", zero_division=0)),
+        "f1_fake": float(f1_score(all_labels, all_preds, pos_label=1, zero_division=0)),
+        "f1_real": float(f1_score(all_labels, all_preds, pos_label=0, zero_division=0)),
+        "roc_auc": roc_auc,
     }
     return metrics, all_preds, all_labels, all_probs
 
@@ -70,6 +83,19 @@ def train_gnn(
     if model_params is None:
         model_params = {}
 
+    # ── Reproducibility ──
+    seed = int(model_params.get("seed", 42))
+    log.info(f"Setting random seed: {seed}")
+
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     architecture = model_params.get("architecture", "gin")
     epochs = int(model_params.get("epochs", 50))
     batch_size = int(model_params.get("batch_size", 64))
@@ -78,10 +104,16 @@ def train_gnn(
     hidden_dim = int(model_params.get("hidden_dim", 128))
     dropout = float(model_params.get("dropout", 0.3))
     patience = int(model_params.get("patience", 10))
+    num_layers = int(model_params.get("num_layers", 3))
+    pooling = model_params.get("pooling")
+    aggregator = model_params.get("aggregator", "mean")
+    use_scheduler = bool(model_params.get("use_lr_scheduler", True))
+    max_grad_norm = float(model_params.get("max_grad_norm", 1.0))
 
     log.info(
-        f"GNN params: arch={architecture}, epochs={epochs}, batch={batch_size}, "
-        f"lr={lr}, hidden={hidden_dim}, dropout={dropout}, patience={patience}"
+        f"GNN params: arch={architecture}, layers={num_layers}, pooling={pooling}, "
+        f"aggregator={aggregator}, hidden={hidden_dim}, dropout={dropout}, "
+        f"epochs={epochs}, batch={batch_size}, lr={lr}, patience={patience}, seed={seed}"
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -91,55 +123,42 @@ def train_gnn(
     retweets = full_data["retweets"]
     replies = full_data["replies"]
 
-    # ── 1. Encode all texts ──
-    if progress_callback:
-        progress_callback("encoding_articles")
-
-    log.info("Encoding articles...")
+    # ── 1. Encode all texts (з persistent cache) ──
     articles_all = pd.concat([
         train_df[["article_id", "combined_text"]],
         val_df[["article_id", "combined_text"]],
         test_df[["article_id", "combined_text"]],
     ]).drop_duplicates(subset=["article_id"]).reset_index(drop=True)
 
-    article_emb = encode_dataframe_column(
-        articles_all, "article_id", "combined_text",
-        max_chars=2000, batch_size=128,
+    dataset_id = full_data.get("dataset_id", "unknown")
+    dataset_folder = full_data.get("dataset_folder", "")
+    force_recompute = bool(model_params.get("force_recompute_embeddings", False))
+
+    embeddings = encode_with_cache(
+        dataset_id=dataset_id,
+        dataset_folder=dataset_folder,
+        articles_df=articles_all,
+        tweets_df=tweets,
+        retweets_df=retweets,
+        replies_df=replies,
+        max_chars_articles=2000,
+        max_chars_tweets=500,
+        force_recompute=force_recompute,
+        progress_callback=progress_callback,
     )
-    log.info(f"  {len(article_emb):,} article embeddings")
 
-    if progress_callback:
-        progress_callback("encoding_tweets")
-    log.info("Encoding tweets...")
-    tweet_emb = {}
-    if len(tweets) > 0 and "tweet_text" in tweets.columns:
-        tweet_emb = encode_dataframe_column(
-            tweets, "tweet_id", "tweet_text",
-            max_chars=500, batch_size=512,
-        )
-    log.info(f"  {len(tweet_emb):,} tweet embeddings")
+    article_emb = embeddings["article_emb"]
+    tweet_emb = embeddings["tweet_emb"]
+    retweet_emb = embeddings["retweet_emb"]
+    reply_emb = embeddings["reply_emb"]
 
-    if progress_callback:
-        progress_callback("encoding_retweets")
-    log.info("Encoding retweets...")
-    retweet_emb = {}
-    if len(retweets) > 0 and "retweet_text" in retweets.columns:
-        retweet_emb = encode_dataframe_column(
-            retweets, "retweet_id", "retweet_text",
-            max_chars=500, batch_size=512,
-        )
-    log.info(f"  {len(retweet_emb):,} retweet embeddings")
-
-    if progress_callback:
-        progress_callback("encoding_replies")
-    log.info("Encoding replies...")
-    reply_emb = {}
-    if len(replies) > 0 and "reply_text" in replies.columns:
-        reply_emb = encode_dataframe_column(
-            replies, "reply_id", "reply_text",
-            max_chars=500, batch_size=512,
-        )
-    log.info(f"  {len(reply_emb):,} reply embeddings")
+    log.info(
+        f"Embeddings ready: "
+        f"articles={len(article_emb):,}, tweets={len(tweet_emb):,}, "
+        f"retweets={len(retweet_emb):,}, replies={len(reply_emb):,}, "
+        f"cache_hits={embeddings['cache_hits']}, "
+        f"time={embeddings['encoding_time']:.1f}s"
+    )
 
     # ── 2. Build graphs ──
     if progress_callback:
@@ -175,7 +194,15 @@ def train_gnn(
 
     # ── 3. Model ──
     in_dim = train_graphs[0].x.shape[1]
-    model = build_gnn_model(architecture, in_dim, hidden_dim, dropout).to(device)
+    model = build_gnn_model(
+        architecture=architecture,
+        in_dim=in_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        num_layers=num_layers,
+        pooling=pooling,
+        aggregator=aggregator,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Trainable params: {n_params:,}")
 
@@ -191,6 +218,17 @@ def train_gnn(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
+
+    scheduler = None
+    if use_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+        )
+        log.info("Using ReduceLROnPlateau scheduler")
 
     # ── 4. Training loop ──
     if progress_callback:
@@ -214,14 +252,25 @@ def train_gnn(
             batch = batch.to(device)
             optimizer.zero_grad()
             logits = model(batch)
-            loss = criterion(logits, batch.y.squeeze())
+
+            labels = batch.y
+            if labels.dim() > 1:
+                labels = labels.squeeze(-1)
+            loss = criterion(logits, labels)
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
             optimizer.step()
             total_loss += loss.item() * batch.num_graphs
             n_samples += batch.num_graphs
         train_loss = total_loss / n_samples
 
         val_metrics, *_ = evaluate_gnn(model, val_loader, device)
+
+        if scheduler is not None:
+            scheduler.step(val_metrics["f1_macro"])
+
         history.append({"epoch": epoch, "train_loss": train_loss, **val_metrics})
 
         improved = val_metrics["f1_macro"] > best_val_f1
@@ -281,10 +330,26 @@ def train_gnn(
         "architecture": architecture,
         "model_dir": str(save_dir),
         "best_model_path": str(best_ckpt_path),
+
+        # Architecture params (для reload)
         "in_dim": in_dim,
         "hidden_dim": hidden_dim,
         "dropout": dropout,
+        "num_layers": num_layers,
+        "pooling": pooling,
+        "aggregator": aggregator,
+
+        # Training metadata
         "best_epoch": best_epoch,
+        "seed": seed,
+        "best_val_f1_macro": best_val_f1,
+
+        # Trained on
+        "trained_on_dataset_id": full_data.get("dataset_id"),
+        "training_time_seconds": elapsed,
+        "n_train_graphs": len(train_graphs),
+        "n_val_graphs": len(val_graphs),
+        "n_test_graphs": len(test_graphs),
     }, pkl_path)
 
     return {

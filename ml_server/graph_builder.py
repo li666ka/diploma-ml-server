@@ -188,3 +188,86 @@ def build_all_graphs(
 
     log.info(f"  Done: {len(graphs):,} graphs")
     return graphs
+
+
+def build_inference_graph(
+    article_text: str,
+    tweets_input: list[dict],
+    retweets_input: list[dict],
+    replies_input: list[dict],
+):
+    """Build PyG Data для inference. Однакова логіка з training (build_graph_for_article),
+    але приймає raw text замість IDs (немає БД).
+
+    tweets_input: [{text}]
+    retweets_input: [{text, original_tweet_idx}]
+    replies_input: [{text, parent_tweet_idx? OR parent_reply_idx?}]
+    """
+    from torch_geometric.data import Data
+
+    from ml_server.encoder import encode_texts_batch
+
+    all_texts = [article_text]
+    all_texts.extend([t.get("text", "") for t in tweets_input])
+    all_texts.extend([rt.get("text", "") for rt in retweets_input])
+    all_texts.extend([rp.get("text", "") for rp in replies_input])
+
+    embs_np = encode_texts_batch(
+        all_texts, batch_size=128, max_chars=2000, show_progress=False
+    )
+    embs = torch.from_numpy(embs_np)
+
+    n_tweets = len(tweets_input)
+    n_retweets = len(retweets_input)
+    n_replies = len(replies_input)
+
+    article_idx = 0
+    tweet_indices = list(range(1, 1 + n_tweets))
+    retweet_indices = list(range(1 + n_tweets, 1 + n_tweets + n_retweets))
+    reply_indices = list(range(
+        1 + n_tweets + n_retweets,
+        1 + n_tweets + n_retweets + n_replies,
+    ))
+
+    edge_src, edge_dst = [], []
+
+    # 1. Tweets → Article
+    for tw_idx in tweet_indices:
+        edge_src.append(tw_idx)
+        edge_dst.append(article_idx)
+
+    # 2. Retweets → Tweet
+    for i, rt in enumerate(retweets_input):
+        orig_idx = rt.get("original_tweet_idx", 0)
+        if 0 <= orig_idx < n_tweets:
+            edge_src.append(retweet_indices[i])
+            edge_dst.append(tweet_indices[orig_idx])
+
+    # 3. Replies → Tweet OR Reply
+    for i, rp in enumerate(replies_input):
+        parent_tw = rp.get("parent_tweet_idx")
+        parent_rp = rp.get("parent_reply_idx")
+
+        if parent_tw is not None and 0 <= parent_tw < n_tweets:
+            edge_src.append(reply_indices[i])
+            edge_dst.append(tweet_indices[parent_tw])
+        elif parent_rp is not None and 0 <= parent_rp < i:
+            edge_src.append(reply_indices[i])
+            edge_dst.append(reply_indices[parent_rp])
+
+    if edge_src:
+        edge_index = torch.tensor(
+            [edge_src + edge_dst, edge_dst + edge_src],
+            dtype=torch.long,
+        )
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    batch = torch.zeros(embs.shape[0], dtype=torch.long)
+
+    return Data(
+        x=embs,
+        edge_index=edge_index,
+        batch=batch,
+        num_nodes=embs.shape[0],
+    )
