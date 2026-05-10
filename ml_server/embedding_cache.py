@@ -190,7 +190,7 @@ def encode_with_cache(
         log.info(f"Encoding {len(articles_df):,} articles...")
         article_emb = encode_dataframe_column(
             articles_df, "article_id", "combined_text",
-            max_chars=max_chars_articles, batch_size=128,
+            max_chars=max_chars_articles, batch_size=64,
         )
         _save_embeddings(article_emb, articles_path)
 
@@ -207,7 +207,7 @@ def encode_with_cache(
             log.info(f"Encoding {len(tweets_df):,} tweets...")
             tweet_emb = encode_dataframe_column(
                 tweets_df, "tweet_id", "tweet_text",
-                max_chars=max_chars_tweets, batch_size=512,
+                max_chars=max_chars_tweets, batch_size=64,
             )
             _save_embeddings(tweet_emb, tweets_path)
 
@@ -224,7 +224,7 @@ def encode_with_cache(
             log.info(f"Encoding {len(retweets_df):,} retweets...")
             retweet_emb = encode_dataframe_column(
                 retweets_df, "retweet_id", "retweet_text",
-                max_chars=max_chars_tweets, batch_size=512,
+                max_chars=max_chars_tweets, batch_size=64,
             )
             _save_embeddings(retweet_emb, retweets_path)
 
@@ -241,7 +241,7 @@ def encode_with_cache(
             log.info(f"Encoding {len(replies_df):,} replies...")
             reply_emb = encode_dataframe_column(
                 replies_df, "reply_id", "reply_text",
-                max_chars=max_chars_tweets, batch_size=512,
+                max_chars=max_chars_tweets, batch_size=64,
             )
             _save_embeddings(reply_emb, replies_path)
 
