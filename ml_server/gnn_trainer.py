@@ -6,6 +6,7 @@ Pipeline:
   3. Train GIN/SAGE з early stopping по val_f1_macro
   4. Test eval, save model
 """
+import gc
 import os
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from ml_server.config import MODELS_ROOT
-from ml_server.embedding_cache import encode_incrementally
+from ml_server.embedding_cache import encode_incrementally_memmap
 from ml_server.gnn_models import build_gnn_model
 from ml_server.graph_builder import build_all_graphs
 from ml_server.utils import create_download_url, log
@@ -134,7 +135,7 @@ def train_gnn(
     dataset_folder = full_data.get("dataset_folder", "")
     force_recompute = bool(model_params.get("force_recompute_embeddings", False))
 
-    embeddings = encode_incrementally(
+    embeddings = encode_incrementally_memmap(
         dataset_id=dataset_id,
         dataset_folder=dataset_folder,
         articles_df=articles_all,
@@ -148,18 +149,32 @@ def train_gnn(
         progress_callback=progress_callback,
     )
 
-    article_emb = embeddings["article_emb"]
-    tweet_emb = embeddings["tweet_emb"]
-    retweet_emb = embeddings["retweet_emb"]
-    reply_emb = embeddings["reply_emb"]
+    # MemmapLookup objects (disk-backed); duck-typed compat з dict[id, tensor]
+    article_emb = embeddings["article_lookup"]
+    tweet_emb = embeddings["tweet_lookup"]
+    retweet_emb = embeddings["retweet_lookup"]
+    reply_emb = embeddings["reply_lookup"]
 
     log.info(
-        f"Embeddings ready: "
-        f"articles={len(article_emb):,}, tweets={len(tweet_emb):,}, "
-        f"retweets={len(retweet_emb):,}, replies={len(reply_emb):,}, "
+        f"Memmap embeddings ready: "
+        f"articles={len(article_emb) if article_emb else 0:,}, "
+        f"tweets={len(tweet_emb) if tweet_emb else 0:,}, "
+        f"retweets={len(retweet_emb) if retweet_emb else 0:,}, "
+        f"replies={len(reply_emb) if reply_emb else 0:,}, "
         f"cache_hits={embeddings['cache_hits']}, "
         f"time={embeddings['encoding_time']:.1f}s"
     )
+
+    gc.collect()
+
+    # Replace None lookups with empty dicts — graph_builder uses `in`/`[]`
+    # на цих об'єктах, тож None спричинить TypeError.
+    if tweet_emb is None:
+        tweet_emb = {}
+    if retweet_emb is None:
+        retweet_emb = {}
+    if reply_emb is None:
+        reply_emb = {}
 
     # ── 2. Build graphs ──
     if progress_callback:

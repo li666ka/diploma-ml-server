@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Optional, Callable
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -383,3 +384,296 @@ def invalidate_all(dataset_id) -> bool:
         log.info(f"Invalidated all cache: {cache_dir}")
         return True
     return False
+
+
+# ── Memmap-backed encoding (для дуже великих datasets) ────────────────────
+
+def encode_incrementally_memmap(
+    dataset_id,
+    dataset_folder: str,
+    articles_df: pd.DataFrame,
+    tweets_df: pd.DataFrame,
+    retweets_df: pd.DataFrame,
+    replies_df: pd.DataFrame,
+    max_chars_articles: int = 2000,
+    max_chars_tweets: int = 500,
+    batch_size: int = 64,
+    force_recompute: bool = False,
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """Disk-backed encoding для дуже великих datasets.
+
+    Замість dict[id, tensor] зберігаємо:
+      - {category}.npy   — numpy memmap[N, 384] (на диску, доступне як array)
+      - {category}_ids.json — {id_str: row_idx} mapping
+    """
+    cache_dir = _cache_dir(dataset_id)
+    dataset_path = Path(dataset_folder) if dataset_folder else None
+
+    log.info(f"═══ Memmap encoding: dataset_{dataset_id} ═══")
+    log.info(f"Cache dir: {cache_dir}")
+
+    def _hash(filename):
+        if dataset_path is None:
+            return "no_folder"
+        return _file_hash(dataset_path / filename)
+
+    hashes = {
+        "articles": _hash("news.csv"),
+        "tweets": _hash("tweets.csv"),
+        "retweets": _hash("retweets.csv"),
+        "replies": _hash("replies.csv"),
+    }
+
+    categories = [
+        ("articles", articles_df, "article_id", "combined_text", max_chars_articles),
+        ("tweets", tweets_df, "tweet_id", "tweet_text", max_chars_tweets),
+        ("retweets", retweets_df, "retweet_id", "retweet_text", max_chars_tweets),
+        ("replies", replies_df, "reply_id", "reply_text", max_chars_tweets),
+    ]
+
+    lookups = {}
+    cache_hits = {}
+    t0 = time.time()
+
+    for name, df, id_col, text_col, max_chars in categories:
+        _log_ram(name, "before")
+
+        npy_path = cache_dir / f"{name}.npy"
+        ids_path = cache_dir / f"{name}_ids.json"
+
+        if df is None or len(df) == 0 or text_col not in df.columns:
+            log.info(f"[{name}] skip: empty")
+            lookups[name] = None
+            cache_hits[name] = "skipped"
+            continue
+
+        cached = (
+            not force_recompute
+            and npy_path.exists()
+            and ids_path.exists()
+            and _is_memmap_cached(cache_dir, name, hashes[name], max_chars)
+        )
+
+        if cached:
+            log.info(f"[{name}] loading from memmap cache...")
+            lookups[name] = MemmapLookup(npy_path, ids_path)
+            cache_hits[name] = "hit"
+            _log_ram(name, "after_cache_hit")
+            continue
+
+        cache_hits[name] = "miss"
+
+        if progress_callback:
+            progress_callback(f"encoding_{name}")
+
+        log.info(f"[{name}] encoding {len(df):,} items → memmap...")
+
+        try:
+            _encode_to_memmap(
+                df=df,
+                id_col=id_col,
+                text_col=text_col,
+                max_chars=max_chars,
+                batch_size=batch_size,
+                npy_path=npy_path,
+                ids_path=ids_path,
+            )
+        except Exception as e:
+            log.error(f"[{name}] encoding FAILED: {e}")
+            if npy_path.exists():
+                npy_path.unlink()
+            if ids_path.exists():
+                ids_path.unlink()
+            raise
+
+        _update_memmap_metadata(cache_dir, name, hashes[name], max_chars)
+
+        lookups[name] = MemmapLookup(npy_path, ids_path)
+        log.info(f"  [{name}] ✓ memmap created and opened")
+
+        _log_ram(name, "after_save")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    elapsed = time.time() - t0
+    log.info(f"═══ Memmap encoding done: time={elapsed:.1f}s ═══")
+    _log_ram("final", "")
+
+    return {
+        "article_lookup": lookups.get("articles"),
+        "tweet_lookup": lookups.get("tweets"),
+        "retweet_lookup": lookups.get("retweets"),
+        "reply_lookup": lookups.get("replies"),
+        "cache_hits": cache_hits,
+        "encoding_time": elapsed,
+    }
+
+
+def _encode_to_memmap(
+    df: pd.DataFrame,
+    id_col: str,
+    text_col: str,
+    max_chars: int,
+    batch_size: int,
+    npy_path: Path,
+    ids_path: Path,
+):
+    """Encode + save directly to disk (numpy memmap)."""
+    from ml_server.encoder import get_encoder
+
+    df_clean = df[[id_col, text_col]].copy()
+    df_clean[text_col] = df_clean[text_col].fillna("").astype(str).str.slice(0, max_chars)
+    df_clean[id_col] = df_clean[id_col].astype(str)
+    df_clean = df_clean.drop_duplicates(subset=[id_col]).reset_index(drop=True)
+
+    n_items = len(df_clean)
+    if n_items == 0:
+        return
+
+    EMBEDDING_DIM = 384
+    chunk_size = 50_000
+
+    id_to_row = {df_clean[id_col].iloc[i]: i for i in range(n_items)}
+
+    tmp_ids = ids_path.with_suffix(".json.tmp")
+    with open(tmp_ids, "w") as f:
+        json.dump(id_to_row, f)
+    tmp_ids.replace(ids_path)
+
+    tmp_npy = npy_path.with_suffix(".npy.tmp")
+    memmap = np.memmap(
+        tmp_npy,
+        dtype=np.float32,
+        mode="w+",
+        shape=(n_items, EMBEDDING_DIM),
+    )
+
+    encoder = get_encoder()
+    texts = df_clean[text_col].tolist()
+
+    n_chunks = (n_items + chunk_size - 1) // chunk_size
+
+    for chunk_idx in range(n_chunks):
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size, n_items)
+
+        log.info(f"    Chunk {chunk_idx + 1}/{n_chunks}: encoding rows {start:,}-{end:,}")
+
+        chunk_texts = texts[start:end]
+        chunk_embs = encoder.encode(
+            chunk_texts,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        ).astype(np.float32)
+
+        memmap[start:end] = chunk_embs
+
+        del chunk_embs, chunk_texts
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    memmap.flush()
+    del memmap
+    gc.collect()
+
+    tmp_npy.replace(npy_path)
+
+    log.info(f"    ✓ memmap saved: {npy_path.name} ({n_items:,} × {EMBEDDING_DIM})")
+
+
+def _is_memmap_cached(
+    cache_dir: Path,
+    category: str,
+    expected_hash: str,
+    expected_max_chars: int,
+) -> bool:
+    meta = _load_metadata(cache_dir)
+    if not meta or meta.get("encoder_version") != ENCODER_VERSION:
+        return False
+
+    cat = meta.get("memmap_categories", {}).get(category)
+    if not cat:
+        return False
+
+    if cat.get("source_hash") != expected_hash:
+        log.info(f"  [{category}] memmap cache stale: source changed")
+        return False
+
+    if cat.get("max_chars") != expected_max_chars:
+        log.info(f"  [{category}] memmap cache stale: max_chars changed")
+        return False
+
+    return True
+
+
+def _update_memmap_metadata(
+    cache_dir: Path,
+    category: str,
+    source_hash: str,
+    max_chars: int,
+):
+    meta = _load_metadata(cache_dir) or {
+        "encoder_version": ENCODER_VERSION,
+        "memmap_categories": {},
+    }
+    meta["encoder_version"] = ENCODER_VERSION
+    meta.setdefault("memmap_categories", {})[category] = {
+        "source_hash": source_hash,
+        "max_chars": max_chars,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _save_metadata(cache_dir, meta)
+
+
+class MemmapLookup:
+    """Disk-backed dict[id, tensor[384]] використовуючи numpy memmap.
+
+    Замість тримати GB у RAM, читаємо rows тільки коли потрібно.
+    OS сам кешує hot pages — для warm access швидкість майже як у RAM.
+    """
+
+    def __init__(self, npy_path: Path, ids_path: Path):
+        self.npy_path = Path(npy_path)
+        self.ids_path = Path(ids_path)
+
+        with open(self.ids_path) as f:
+            self.id_to_row = json.load(f)
+
+        n_items = len(self.id_to_row)
+        self.memmap = np.memmap(
+            self.npy_path,
+            dtype=np.float32,
+            mode="r",
+            shape=(n_items, 384),
+        )
+
+        log.info(f"  MemmapLookup opened: {self.npy_path.name} ({n_items:,} items)")
+
+    def __contains__(self, key) -> bool:
+        return str(key) in self.id_to_row
+
+    def __len__(self) -> int:
+        return len(self.id_to_row)
+
+    def get(self, key, default=None):
+        key_str = str(key)
+        if key_str not in self.id_to_row:
+            return default
+        row_idx = self.id_to_row[key_str]
+        arr = np.array(self.memmap[row_idx], dtype=np.float32)
+        return torch.from_numpy(arr)
+
+    def __getitem__(self, key):
+        result = self.get(key)
+        if result is None:
+            raise KeyError(key)
+        return result
+
+    def keys(self):
+        return self.id_to_row.keys()
