@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from ml_server.config import MODELS_ROOT
-from ml_server.embedding_cache import encode_with_cache
+from ml_server.embedding_cache import encode_incrementally
 from ml_server.gnn_models import build_gnn_model
 from ml_server.graph_builder import build_all_graphs
 from ml_server.utils import create_download_url, log
@@ -134,7 +134,7 @@ def train_gnn(
     dataset_folder = full_data.get("dataset_folder", "")
     force_recompute = bool(model_params.get("force_recompute_embeddings", False))
 
-    embeddings = encode_with_cache(
+    embeddings = encode_incrementally(
         dataset_id=dataset_id,
         dataset_folder=dataset_folder,
         articles_df=articles_all,
@@ -143,6 +143,7 @@ def train_gnn(
         replies_df=replies,
         max_chars_articles=2000,
         max_chars_tweets=500,
+        batch_size=64,
         force_recompute=force_recompute,
         progress_callback=progress_callback,
     )

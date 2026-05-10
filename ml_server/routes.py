@@ -305,16 +305,34 @@ def register_routes(app: Flask):
 
     @app.route("/embedding_cache/<dataset_id>", methods=["GET"])
     def get_embedding_cache_route(dataset_id):
-        """Cache info для dataset."""
-        from ml_server.embedding_cache import get_cache_info
-        return jsonify(get_cache_info(dataset_id))
+        """Cache info для dataset (overall + per-category)."""
+        from ml_server.embedding_cache import get_cache_status
+        status = get_cache_status(dataset_id)
+        # Backward-compat поля для старого FastAPI proxy
+        status["total_size_mb"] = status.get("total_size_mb", 0)
+        return jsonify(status)
+
+    @app.route("/embedding_cache/<dataset_id>/status", methods=["GET"])
+    def cache_status_route(dataset_id):
+        """Per-category cache status."""
+        from ml_server.embedding_cache import get_cache_status
+        return jsonify(get_cache_status(dataset_id))
 
     @app.route("/embedding_cache/<dataset_id>", methods=["DELETE"])
     def invalidate_embedding_cache_route(dataset_id):
-        """Видалити cache для dataset."""
-        from ml_server.embedding_cache import invalidate_cache
-        success = invalidate_cache(dataset_id)
+        """Видалити весь кеш для dataset."""
+        from ml_server.embedding_cache import invalidate_all
+        success = invalidate_all(dataset_id)
         return jsonify({"invalidated": success})
+
+    @app.route("/embedding_cache/<dataset_id>/<category>", methods=["DELETE"])
+    def invalidate_embedding_category_route(dataset_id, category):
+        """Очистити одну категорію (articles/tweets/retweets/replies)."""
+        from ml_server.embedding_cache import invalidate_category
+        if category not in ("articles", "tweets", "retweets", "replies"):
+            return jsonify({"error": "Invalid category"}), 400
+        success = invalidate_category(dataset_id, category)
+        return jsonify({"invalidated": success, "category": category})
 
     return app
 

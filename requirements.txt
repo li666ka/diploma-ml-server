@@ -18,3 +18,4 @@ tqdm>=4.66
 python-dotenv>=1.0
 emoji>=2.0
 nltk>=3.8
+psutil>=5.9
