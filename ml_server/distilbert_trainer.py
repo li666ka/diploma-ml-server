@@ -202,8 +202,12 @@ def train_distilbert_article_level(
     metrics["test_size"] = len(df_test)
 
     log.info(
-        f"DistilBERT done: acc={metrics['accuracy']:.4f}, "
-        f"f1={metrics['f1_score']:.4f}, f1_macro={metrics['f1_macro']:.4f}"
+        f"DistilBERT done (FAKE class for P/R/F1): "
+        f"acc={metrics['accuracy']:.4f}, "
+        f"precision={metrics['precision']:.4f}, "
+        f"recall={metrics['recall']:.4f}, "
+        f"f1={metrics['f1_score']:.4f}, "
+        f"f1_macro={metrics['f1_macro']:.4f}"
         + (f", roc_auc={metrics['roc_auc']:.4f}" if metrics.get("roc_auc") is not None else "")
     )
 

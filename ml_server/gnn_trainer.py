@@ -27,8 +27,8 @@ from ml_server.utils import create_download_url, log
 
 @torch.no_grad()
 def evaluate_gnn(model, loader, device):
-    """Returns (metrics_dict, preds, labels, probs). Безпечне для edge cases."""
-    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+    """Evaluate GNN. Використовує єдиний compute_metrics() з utils."""
+    from ml_server.utils import compute_metrics
 
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
@@ -51,20 +51,12 @@ def evaluate_gnn(model, loader, device):
     all_labels = torch.cat(all_labels).numpy()
     all_probs = torch.cat(all_probs).numpy()
 
-    unique_labels = np.unique(all_labels)
-    if len(unique_labels) >= 2:
-        roc_auc = float(roc_auc_score(all_labels, all_probs))
-    else:
-        log.warning(f"ROC-AUC undefined: y_true має тільки клас {unique_labels[0]}")
-        roc_auc = float("nan")
+    metrics = compute_metrics(
+        y_true=all_labels,
+        y_pred=all_preds,
+        y_proba=all_probs,
+    )
 
-    metrics = {
-        "accuracy": float(accuracy_score(all_labels, all_preds)),
-        "f1_macro": float(f1_score(all_labels, all_preds, average="macro", zero_division=0)),
-        "f1_fake": float(f1_score(all_labels, all_preds, pos_label=1, zero_division=0)),
-        "f1_real": float(f1_score(all_labels, all_preds, pos_label=0, zero_division=0)),
-        "roc_auc": roc_auc,
-    }
     return metrics, all_preds, all_labels, all_probs
 
 
@@ -291,11 +283,13 @@ def train_gnn(
 
         improved = val_metrics["f1_macro"] > best_val_f1
         marker = "⭐" if improved else "  "
+        val_auc = val_metrics.get("roc_auc")
+        val_auc_str = f"{val_auc:.4f}" if val_auc is not None else "n/a"
         log.info(
             f"  {marker} epoch {epoch:3d}  loss={train_loss:.4f}  "
             f"val_f1_macro={val_metrics['f1_macro']:.4f}  "
-            f"val_f1_fake={val_metrics['f1_fake']:.4f}  "
-            f"val_auc={val_metrics['roc_auc']:.4f}"
+            f"val_f1_score={val_metrics['f1_score']:.4f}  "
+            f"val_auc={val_auc_str}"
         )
 
         if improved:
@@ -319,13 +313,9 @@ def train_gnn(
     model.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
     test_metrics, _, _, _ = evaluate_gnn(model, test_loader, device)
 
+    # test_metrics вже містить повний набір з compute_metrics()
     metrics = {
-        "accuracy": test_metrics["accuracy"],
-        "f1_macro": test_metrics["f1_macro"],
-        "f1_score": test_metrics["f1_fake"],  # для UI compat
-        "f1_fake": test_metrics["f1_fake"],
-        "f1_real": test_metrics["f1_real"],
-        "roc_auc": test_metrics["roc_auc"],
+        **test_metrics,
         "training_time": elapsed,
         "best_epoch": best_epoch,
         "train_size": len(train_graphs),
@@ -334,8 +324,13 @@ def train_gnn(
     }
 
     log.info(
-        f"Test: f1_macro={metrics['f1_macro']:.4f}, "
-        f"f1_fake={metrics['f1_fake']:.4f}, auc={metrics['roc_auc']:.4f}"
+        f"Test metrics (FAKE class for P/R/F1): "
+        f"acc={metrics['accuracy']:.4f}, "
+        f"precision={metrics['precision']:.4f}, "
+        f"recall={metrics['recall']:.4f}, "
+        f"f1={metrics['f1_score']:.4f}, "
+        f"f1_macro={metrics['f1_macro']:.4f}, "
+        f"auc={metrics['roc_auc']}"
     )
 
     # ── 6. Save bundle ──

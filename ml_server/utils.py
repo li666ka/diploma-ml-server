@@ -67,7 +67,44 @@ def compute_metrics(
     training_time: Optional[float] = None,
     y_proba: Optional[np.ndarray] = None,
 ) -> dict:
-    """Стандартний набір метрик для бінарної класифікації."""
+    """Єдине джерело істини для метрик бінарної класифікації фейкових новин.
+
+    Конвенція класів:
+        REAL = 0 (negative class)
+        FAKE = 1 (positive class)
+
+    Returns dict з полями:
+        accuracy:         Загальна точність (для обох класів разом)
+        precision:        Precision для FAKE класу (pos_label=1)
+                          = TP / (TP + FP)
+                          "З передбачених FAKE — скільки дійсно FAKE"
+        recall:           Recall для FAKE класу (pos_label=1)
+                          = TP / (TP + FN)
+                          "Зі справжніх FAKE — скільки знайшли"
+        f1_score:         F1 для FAKE класу (harmonic mean precision/recall)
+        f1_macro:         Незважене середнє F1 для обох класів
+                          (REAL і FAKE враховуються однаково)
+        roc_auc:          Area Under ROC Curve (probabilistic metric)
+        confusion_matrix: {tn, fp, fn, tp} де:
+                          tn = True Negative  (REAL → REAL)
+                          fp = False Positive (REAL → FAKE)
+                          fn = False Negative (FAKE → REAL)
+                          tp = True Positive  (FAKE → FAKE)
+
+    Args:
+        y_true: ground truth labels (0=REAL, 1=FAKE)
+        y_pred: predicted labels (0=REAL, 1=FAKE)
+        training_time: тривалість тренування у секундах (optional)
+        y_proba: probabilities для FAKE класу (optional, для ROC-AUC)
+
+    Example:
+        >>> y_true = [0, 0, 1, 1, 1]
+        >>> y_pred = [0, 1, 1, 1, 0]
+        >>> m = compute_metrics(y_true, y_pred)
+        >>> # accuracy = 3/5 = 0.6
+        >>> # precision (FAKE) = 2 правильно FAKE / 3 передбачено FAKE = 0.667
+        >>> # recall (FAKE) = 2 знайдено FAKE / 3 справжніх FAKE = 0.667
+    """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
@@ -76,24 +113,22 @@ def compute_metrics(
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = (int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1]))
 
+    # pos_label=1 → всі precision/recall/f1 стосуються FAKE класу.
+    # Це конвенція: детекція FAKE — це positive class у нашій задачі.
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, pos_label=1, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, pos_label=1, zero_division=0)),
         "f1_score": float(f1_score(y_true, y_pred, pos_label=1, zero_division=0)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "f1_fake": float(f1_score(y_true, y_pred, pos_label=1, zero_division=0)),
-        "f1_real": float(f1_score(y_true, y_pred, pos_label=0, zero_division=0)),
         "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
     }
 
     if y_proba is not None:
         try:
             proba = np.asarray(y_proba)
-            # Підтримати і [N] (probas FAKE), і [N, 2] (full)
             if proba.ndim == 2 and proba.shape[1] >= 2:
                 proba = proba[:, 1]
-            # ROC-AUC undefined якщо в y_true тільки один клас
             if len(np.unique(y_true)) >= 2:
                 metrics["roc_auc"] = float(roc_auc_score(y_true, proba))
             else:
@@ -102,6 +137,8 @@ def compute_metrics(
         except Exception as e:
             log.warning(f"ROC-AUC computation failed: {e}")
             metrics["roc_auc"] = None
+    else:
+        metrics["roc_auc"] = None
 
     if training_time is not None:
         metrics["training_time"] = round(training_time, 2)
