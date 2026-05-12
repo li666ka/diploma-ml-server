@@ -23,7 +23,13 @@ from sklearn.naive_bayes import ComplementNB, MultinomialNB
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
 
-from ml_server.utils import compute_metrics, create_download_url, log, preprocess_text
+from ml_server.utils import (
+    compute_metrics,
+    create_download_url,
+    ensure_meaningful_experiment_id,
+    log,
+    preprocess_text,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -297,6 +303,9 @@ def train_nb(
     """
     if preprocessing is None:
         preprocessing = {}
+
+    experiment_id = ensure_meaningful_experiment_id(experiment_id, "nb")
+    log.info(f"NB experiment_id: {experiment_id}")
 
     if not use_text and not additional_features:
         raise ValueError(
@@ -681,6 +690,9 @@ def train_nb_aggregated(
         rhetorical_features = []
     if social_features is None:
         social_features = []
+
+    experiment_id = ensure_meaningful_experiment_id(experiment_id, "nb_aggregated")
+    log.info(f"NB aggregated experiment_id: {experiment_id}")
 
     text_based_additional = (
         list(emotional_features) + list(stylistic_features) + list(rhetorical_features)

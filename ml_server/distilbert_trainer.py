@@ -10,7 +10,13 @@ import pandas as pd
 import torch
 
 from ml_server.config import MODELS_ROOT
-from ml_server.utils import compute_metrics, create_download_url, log, preprocess_text
+from ml_server.utils import (
+    compute_metrics,
+    create_download_url,
+    ensure_meaningful_experiment_id,
+    log,
+    preprocess_text,
+)
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -45,6 +51,9 @@ def train_distilbert_article_level(
 
     if model_params is None:
         model_params = {}
+
+    experiment_id = ensure_meaningful_experiment_id(experiment_id, "distilbert")
+    log.info(f"DistilBERT experiment_id: {experiment_id}")
 
     from datasets import Dataset
     from transformers import (

@@ -168,3 +168,22 @@ def create_download_url(filepath: str) -> str | None:
     if not filepath:
         return None
     return f"file://{filepath}"
+
+
+_DEFAULT_EXP_RE = re.compile(r"^default(_experiment|_exp)?$", re.IGNORECASE)
+
+
+def ensure_meaningful_experiment_id(
+    experiment_id: Optional[str],
+    model_type: str,
+) -> str:
+    """Fallback: якщо клієнт прислав 'default*' / порожній — додати timestamp.
+
+    API server вже зазвичай генерує informative ID, але ML-server не довіряє
+    клієнту наосліп — щоб не отримати папку 'default_experiment' від старого
+    клієнта чи прямого виклику.
+    """
+    if not experiment_id or _DEFAULT_EXP_RE.match(str(experiment_id).strip()):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        return f"{(model_type or 'model').lower()}_{ts}"
+    return str(experiment_id)

@@ -22,7 +22,7 @@ from ml_server.config import MODELS_ROOT
 from ml_server.embedding_cache import encode_incrementally_memmap
 from ml_server.gnn_models import build_gnn_model
 from ml_server.graph_builder import build_all_graphs
-from ml_server.utils import create_download_url, log
+from ml_server.utils import create_download_url, ensure_meaningful_experiment_id, log
 
 
 @torch.no_grad()
@@ -75,6 +75,11 @@ def train_gnn(
 
     if model_params is None:
         model_params = {}
+
+    # Для GNN architecture (gin/sage) — використати як префікс типу.
+    arch_for_id = (model_params.get("architecture") or "gnn").lower()
+    experiment_id = ensure_meaningful_experiment_id(experiment_id, arch_for_id)
+    log.info(f"GNN experiment_id: {experiment_id} (arch={arch_for_id})")
 
     # ── Reproducibility ──
     seed = int(model_params.get("seed", 42))
