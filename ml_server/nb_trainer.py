@@ -595,16 +595,11 @@ def train_nb(
         # Mode A: standalone vectorizer
         top_words = _extract_top_words(pipeline)
 
-    save_path = (
-        f"/content/drive/MyDrive/diploma_models/user_{user_id}/"
-        f"model_nb_{experiment_id}.pkl"
-    )
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    # Підпапка моделі — туди йде канонічний model.pkl + predictions.json.
-    nb_model_dir = Path(save_path).parent / f"nb_{experiment_id}"
+    # Канонічна структура: user_X/nb_<exp>/model.pkl + predictions.json
+    from ml_server.config import MODELS_ROOT
+    nb_model_dir = Path(MODELS_ROOT) / f"user_{user_id}" / f"nb_{experiment_id}"
     nb_model_dir.mkdir(parents=True, exist_ok=True)
-    nb_model_path = nb_model_dir / "model.pkl"
+    model_path = nb_model_dir / "model.pkl"
 
     bundle = {
         "pipeline": pipeline,
@@ -620,11 +615,8 @@ def train_nb(
         "additional_features": list(additional_features) if additional_features else [],
         "use_text": use_text,
     }
-    joblib.dump(bundle, nb_model_path)
-    # Backward-compat: legacy шлях user_X/model_nb_<exp>.pkl
-    import shutil
-    shutil.copy(nb_model_path, save_path)
-    log.info(f"  Saved article-level NB → {nb_model_path} (+ legacy copy {save_path})")
+    joblib.dump(bundle, model_path)
+    log.info(f"  Saved article-level NB → {model_path}")
 
     # Save predictions для подальшого використання в ансамблях
     try:
@@ -653,12 +645,13 @@ def train_nb(
         log.warning(f"Failed to save predictions: {e}")
 
     return {
-        "path": save_path,
+        "path": str(model_path),
+        "model_dir": str(nb_model_dir),
         "metrics": metrics,
         "top_words": top_words,
         "alpha_search": alpha_search,
         "best_alpha": float(chosen_alpha),
-        "download_url": create_download_url(save_path),
+        "download_url": create_download_url(str(model_path)),
     }
 
 
@@ -799,11 +792,14 @@ def train_nb_aggregated(
         if f in df_train.columns:
             social_train_mean[f] = float(df_train[f].mean())
 
-    save_path = (
-        f"/content/drive/MyDrive/diploma_models/user_{user_id}/"
-        f"model_nb_{experiment_id}.pkl"
+    # Канонічна структура: user_X/nb_aggregated_<exp>/model.pkl + predictions.json
+    from ml_server.config import MODELS_ROOT
+    agg_model_dir = (
+        Path(MODELS_ROOT) / f"user_{user_id}" / f"nb_aggregated_{experiment_id}"
     )
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    agg_model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = agg_model_dir / "model.pkl"
+
     joblib.dump({
         "pipeline": pipeline,
         "preprocessing": dict(preprocessing),
@@ -814,12 +810,42 @@ def train_nb_aggregated(
         "rhetorical_features": list(rhetorical_features),
         "social_features": list(social_features),
         "social_train_mean": social_train_mean,
-    }, save_path)
-    log.info(f"  Saved aggregated NB → {save_path}")
+    }, model_path)
+    log.info(f"  Saved aggregated NB → {model_path}")
+
+    # Save predictions для подальшого використання в ансамблях
+    try:
+        from ml_server.predictions_cache import save_predictions
+
+        if hasattr(pipeline, "predict_proba"):
+            proba = pipeline.predict_proba(X_test)
+            y_proba_fake = proba[:, 1] if proba.shape[1] >= 2 else proba.ravel()
+        else:
+            y_proba_fake = np.asarray(y_pred, dtype=np.float32)
+
+        if "article_id" in df_test.columns:
+            article_ids = df_test["article_id"].astype(str).tolist()
+        else:
+            article_ids = [str(i) for i in range(len(y_pred))]
+
+        save_predictions(
+            model_dir=agg_model_dir,
+            article_ids=article_ids,
+            y_true=np.asarray(y_test),
+            y_pred=np.asarray(y_pred),
+            y_proba_fake=y_proba_fake,
+            metrics=metrics,
+            model_type="nb_aggregated",
+            splits_used="unknown",
+            dataset_id="unknown",
+        )
+    except Exception as e:
+        log.warning(f"Failed to save aggregated NB predictions: {e}")
 
     return {
-        "path": save_path,
+        "path": str(model_path),
+        "model_dir": str(agg_model_dir),
         "metrics": metrics,
         "top_words": top_words,
-        "download_url": create_download_url(save_path),
+        "download_url": create_download_url(str(model_path)),
     }
