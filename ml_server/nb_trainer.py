@@ -11,6 +11,7 @@
 """
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import joblib
@@ -615,6 +616,32 @@ def train_nb(
     }
     joblib.dump(bundle, save_path)
     log.info(f"  Saved article-level NB → {save_path}")
+
+    # Save predictions для подальшого використання в ансамблях
+    try:
+        from ml_server.predictions_cache import save_predictions
+
+        if hasattr(pipeline, "predict_proba"):
+            proba = pipeline.predict_proba(X_test)
+            y_proba_fake = proba[:, 1] if proba.shape[1] >= 2 else proba.ravel()
+        else:
+            y_proba_fake = y_pred.astype(np.float32)
+
+        article_ids = df_test["article_id"].astype(str).tolist()
+
+        save_predictions(
+            model_dir=Path(save_path).parent,
+            article_ids=article_ids,
+            y_true=y_test,
+            y_pred=y_pred,
+            y_proba_fake=y_proba_fake,
+            metrics=metrics,
+            model_type="nb",
+            splits_used=(full_data or {}).get("splits_subdir", "unknown"),
+            dataset_id=(full_data or {}).get("dataset_id", "unknown"),
+        )
+    except Exception as e:
+        log.warning(f"Failed to save predictions: {e}")
 
     return {
         "path": save_path,

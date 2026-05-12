@@ -38,6 +38,7 @@ def train_distilbert_article_level(
     experiment_id: str,
     model_params: Optional[dict] = None,
     progress_callback: Optional[callable] = None,
+    full_data: Optional[dict] = None,
 ) -> dict:
     """Fine-tune DistilBERT на article_text. БЕЗ aggregation."""
     global _distilbert_model, _distilbert_tokenizer
@@ -76,6 +77,9 @@ def train_distilbert_article_level(
         columns={"combined_text": "text"}).copy()
     df_test = test_df[["combined_text", "label"]].rename(
         columns={"combined_text": "text"}).copy()
+    # Зберегти article_id для predictions cache (вирівнюємо з df_test по index)
+    if "article_id" in test_df.columns:
+        df_test["article_id"] = test_df["article_id"].values
 
     df_train["text"] = df_train["text"].apply(lambda t: preprocess_text(t, light_opts))
     df_val["text"] = df_val["text"].apply(lambda t: preprocess_text(t, light_opts))
@@ -83,7 +87,14 @@ def train_distilbert_article_level(
 
     df_train = df_train.dropna()
     df_val = df_val.dropna()
-    df_test = df_test.dropna()
+    df_test = df_test.dropna().reset_index(drop=True)
+    test_article_ids = (
+        df_test["article_id"].astype(str).tolist()
+        if "article_id" in df_test.columns
+        else [str(i) for i in range(len(df_test))]
+    )
+    # Видаляємо article_id з df_test — Dataset.from_pandas передасть лише text/label
+    df_test_for_dataset = df_test.drop(columns=["article_id"], errors="ignore").reset_index(drop=True)
 
     df_train["label"] = df_train["label"].astype(int)
     df_val["label"] = df_val["label"].astype(int)
@@ -124,7 +135,7 @@ def train_distilbert_article_level(
     # Tokenize
     train_dataset = Dataset.from_pandas(df_train.reset_index(drop=True))
     val_dataset = Dataset.from_pandas(df_val.reset_index(drop=True))
-    test_dataset = Dataset.from_pandas(df_test.reset_index(drop=True))
+    test_dataset = Dataset.from_pandas(df_test_for_dataset.reset_index(drop=True))
 
     def tokenize_fn(examples):
         return tokenizer(
@@ -227,6 +238,24 @@ def train_distilbert_article_level(
         "model_name": model_name,
         "max_length": max_len,
     }, pkl_path)
+
+    # Save predictions для подальшого використання в ансамблях
+    try:
+        from ml_server.predictions_cache import save_predictions
+
+        save_predictions(
+            model_dir=Path(save_dir),
+            article_ids=test_article_ids,
+            y_true=y_test,
+            y_pred=y_pred,
+            y_proba_fake=y_proba_fake,
+            metrics=metrics,
+            model_type="distilbert",
+            splits_used=(full_data or {}).get("splits_subdir", "unknown"),
+            dataset_id=(full_data or {}).get("dataset_id", "unknown"),
+        )
+    except Exception as e:
+        log.warning(f"Failed to save predictions: {e}")
 
     return {
         "path": str(pkl_path),

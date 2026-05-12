@@ -451,7 +451,7 @@ def _run_training_impl(payload: dict) -> dict:
 
         # ── Branch 2: DistilBERT — article-level ──
         elif model_type in ("distilbert", "deberta", "bert"):
-            train_df, val_df, test_df, _, data_stats, tmpdir = (
+            train_df, val_df, test_df, full_data, data_stats, tmpdir = (
                 build_article_level_data(
                     dataset_id=dataset_id, dataset_name=dataset_name,
                     test_ratio=float(data_params.get("test_ratio", 0.15)),
@@ -467,6 +467,7 @@ def _run_training_impl(payload: dict) -> dict:
                 user_id=user_id, experiment_id=experiment_id,
                 model_params=model_params,
                 progress_callback=progress_callback,
+                full_data=full_data,
             )
             result["data_stats"] = data_stats
 

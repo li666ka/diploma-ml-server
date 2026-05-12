@@ -311,7 +311,9 @@ def train_gnn(
     # ── 5. Test eval з best model ──
     log.info(f"Loading best model (epoch {best_epoch})")
     model.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
-    test_metrics, _, _, _ = evaluate_gnn(model, test_loader, device)
+    test_metrics, test_preds, test_labels, test_probs = evaluate_gnn(
+        model, test_loader, device
+    )
 
     # test_metrics вже містить повний набір з compute_metrics()
     metrics = {
@@ -362,6 +364,34 @@ def train_gnn(
         "n_val_graphs": len(val_graphs),
         "n_test_graphs": len(test_graphs),
     }, pkl_path)
+
+    # Save predictions для подальшого використання в ансамблях
+    try:
+        from ml_server.predictions_cache import save_predictions
+
+        # article_ids у тому ж порядку що test_graphs (test_loader без shuffle).
+        # build_all_graphs може пропустити статті без embedding — беремо ids
+        # з самих graphs, а не з test_df, щоб гарантувати alignment.
+        article_ids = [str(getattr(g, "article_id", "")) for g in test_graphs]
+
+        assert len(article_ids) == len(test_preds) == len(test_labels), (
+            f"Mismatch: aids={len(article_ids)}, preds={len(test_preds)}, "
+            f"labels={len(test_labels)}"
+        )
+
+        save_predictions(
+            model_dir=Path(save_dir),
+            article_ids=article_ids,
+            y_true=test_labels,
+            y_pred=test_preds,
+            y_proba_fake=test_probs,
+            metrics=metrics,
+            model_type=architecture,
+            splits_used=full_data.get("splits_subdir", "unknown"),
+            dataset_id=full_data.get("dataset_id", "unknown"),
+        )
+    except Exception as e:
+        log.warning(f"Failed to save predictions: {e}")
 
     return {
         "path": str(pkl_path),
