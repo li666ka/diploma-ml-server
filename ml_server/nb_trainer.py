@@ -628,6 +628,7 @@ def train_nb(
     log.info(f"  Saved article-level NB → {model_path}")
 
     # Save predictions для подальшого використання в ансамблях
+    predictions_compact = None
     try:
         from ml_server.predictions_cache import save_predictions
 
@@ -639,7 +640,7 @@ def train_nb(
 
         article_ids = df_test["article_id"].astype(str).tolist()
 
-        save_predictions(
+        preds_result = save_predictions(
             model_dir=nb_model_dir,
             article_ids=article_ids,
             y_true=y_test,
@@ -650,6 +651,7 @@ def train_nb(
             splits_used=(full_data or {}).get("splits_subdir", "unknown"),
             dataset_id=(full_data or {}).get("dataset_id", "unknown"),
         )
+        predictions_compact = preds_result["compact_json"]
     except Exception as e:
         log.warning(f"Failed to save predictions: {e}")
 
@@ -657,6 +659,7 @@ def train_nb(
         "path": str(model_path),
         "model_dir": str(nb_model_dir),
         "metrics": metrics,
+        "predictions_compact": predictions_compact,
         "top_words": top_words,
         "alpha_search": alpha_search,
         "best_alpha": float(chosen_alpha),
@@ -826,6 +829,7 @@ def train_nb_aggregated(
     log.info(f"  Saved aggregated NB → {model_path}")
 
     # Save predictions для подальшого використання в ансамблях
+    predictions_compact = None
     try:
         from ml_server.predictions_cache import save_predictions
 
@@ -840,7 +844,7 @@ def train_nb_aggregated(
         else:
             article_ids = [str(i) for i in range(len(y_pred))]
 
-        save_predictions(
+        preds_result = save_predictions(
             model_dir=agg_model_dir,
             article_ids=article_ids,
             y_true=np.asarray(y_test),
@@ -851,6 +855,7 @@ def train_nb_aggregated(
             splits_used="unknown",
             dataset_id="unknown",
         )
+        predictions_compact = preds_result["compact_json"]
     except Exception as e:
         log.warning(f"Failed to save aggregated NB predictions: {e}")
 
@@ -858,6 +863,7 @@ def train_nb_aggregated(
         "path": str(model_path),
         "model_dir": str(agg_model_dir),
         "metrics": metrics,
+        "predictions_compact": predictions_compact,
         "top_words": top_words,
         "download_url": create_download_url(str(model_path)),
     }

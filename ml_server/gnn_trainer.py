@@ -371,6 +371,7 @@ def train_gnn(
     }, pkl_path)
 
     # Save predictions для подальшого використання в ансамблях
+    predictions_compact = None
     try:
         from ml_server.predictions_cache import save_predictions
 
@@ -384,7 +385,7 @@ def train_gnn(
             f"labels={len(test_labels)}"
         )
 
-        save_predictions(
+        preds_result = save_predictions(
             model_dir=Path(save_dir),
             article_ids=article_ids,
             y_true=test_labels,
@@ -395,12 +396,14 @@ def train_gnn(
             splits_used=full_data.get("splits_subdir", "unknown"),
             dataset_id=full_data.get("dataset_id", "unknown"),
         )
+        predictions_compact = preds_result["compact_json"]
     except Exception as e:
         log.warning(f"Failed to save predictions: {e}")
 
     return {
         "path": str(pkl_path),
         "metrics": metrics,
+        "predictions_compact": predictions_compact,
         "history": history,
         "download_url": create_download_url(str(pkl_path)),
     }

@@ -24,26 +24,13 @@ def save_predictions(
     splits_used: str,
     dataset_id: int | str,
     model_record_id: int | None = None,
-) -> Path:
+) -> dict:
     """
-    Зберегти predictions у model_dir/predictions.json
-    або model_dir/predictions_{model_record_id}.json (якщо id переданий).
-
-    Args:
-        model_dir: куди зберегти (директорія моделі)
-        article_ids: ID статей у test set (порядок ВАЖЛИВИЙ — той самий що y_pred)
-        y_true: ground truth labels
-        y_pred: predicted labels
-        y_proba_fake: probability що FAKE (для soft voting)
-        metrics: dict з accuracy, precision, etc.
-        model_type: 'nb' | 'distilbert' | 'gin' | 'sage' | 'llm'
-        splits_used: 'splits_in_domain' | 'splits_cross_domain'
-        dataset_id: для validation що ансамбль на тому ж dataset
-        model_record_id: якщо переданий — файл називається
-            predictions_{id}.json (унікальний для кожної моделі).
+    Зберегти predictions у model_dir/predictions.json (на Drive) ТА повернути
+    compact dict для збереження у БД як `predictions_json`.
 
     Returns:
-        Path до predictions.json
+        {"path": "/abs/path/predictions.json", "compact_json": {...}}
     """
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -61,7 +48,6 @@ def save_predictions(
     if isinstance(y_proba_fake, np.ndarray):
         y_proba_fake = y_proba_fake.tolist()
 
-    # Validate lengths
     n = len(article_ids)
     if not (len(y_true) == n and len(y_pred) == n and len(y_proba_fake) == n):
         raise ValueError(
@@ -69,16 +55,22 @@ def save_predictions(
             f"y_pred={len(y_pred)}, y_proba={len(y_proba_fake)}"
         )
 
-    # Build predictions list
-    predictions = []
-    for i in range(n):
-        predictions.append({
-            "article_id": str(article_ids[i]),
-            "y_true": int(y_true[i]),
-            "y_pred": int(y_pred[i]),
-            "y_proba_fake": float(y_proba_fake[i]),
-        })
+    aid_list = [str(a) for a in article_ids]
+    y_true_list = [int(v) for v in y_true]
+    y_pred_list = [int(v) for v in y_pred]
+    y_proba_list = [float(v) for v in y_proba_fake]
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
 
+    # Detailed per-row form для Drive backup (зручно для debug)
+    predictions = [
+        {
+            "article_id": aid_list[i],
+            "y_true": y_true_list[i],
+            "y_pred": y_pred_list[i],
+            "y_proba_fake": y_proba_list[i],
+        }
+        for i in range(n)
+    ]
     data = {
         "model_type": model_type,
         "splits_used": splits_used,
@@ -86,17 +78,29 @@ def save_predictions(
         "test_size": n,
         "predictions": predictions,
         "metrics": metrics,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "created_at": created_at,
     }
 
-    # Atomic write через .tmp
     tmp_path = predictions_path.with_suffix(".json.tmp")
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
     tmp_path.replace(predictions_path)
-
     log.info(f"Saved predictions: {predictions_path} ({n} items)")
-    return predictions_path
+
+    # Compact form для БД — колоночні масиви, без metrics (metrics_json окремо).
+    compact_json = {
+        "article_ids": aid_list,
+        "y_true": y_true_list,
+        "y_pred": y_pred_list,
+        "y_proba_fake": y_proba_list,
+        "model_type": model_type,
+        "splits_used": splits_used,
+        "dataset_id": str(dataset_id),
+        "test_size": n,
+        "created_at": created_at,
+    }
+
+    return {"path": str(predictions_path), "compact_json": compact_json}
 
 
 def load_predictions(predictions_path: str | Path) -> dict:
