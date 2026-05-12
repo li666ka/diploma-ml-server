@@ -23,9 +23,11 @@ def save_predictions(
     model_type: str,
     splits_used: str,
     dataset_id: int | str,
+    model_record_id: int | None = None,
 ) -> Path:
     """
-    Зберегти predictions у model_dir/predictions.json.
+    Зберегти predictions у model_dir/predictions.json
+    або model_dir/predictions_{model_record_id}.json (якщо id переданий).
 
     Args:
         model_dir: куди зберегти (директорія моделі)
@@ -37,6 +39,8 @@ def save_predictions(
         model_type: 'nb' | 'distilbert' | 'gin' | 'sage' | 'llm'
         splits_used: 'splits_in_domain' | 'splits_cross_domain'
         dataset_id: для validation що ансамбль на тому ж dataset
+        model_record_id: якщо переданий — файл називається
+            predictions_{id}.json (унікальний для кожної моделі).
 
     Returns:
         Path до predictions.json
@@ -44,7 +48,10 @@ def save_predictions(
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    predictions_path = model_dir / "predictions.json"
+    if model_record_id:
+        predictions_path = model_dir / f"predictions_{model_record_id}.json"
+    else:
+        predictions_path = model_dir / "predictions.json"
 
     # Конвертувати numpy → Python native types
     if isinstance(y_true, np.ndarray):

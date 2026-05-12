@@ -600,6 +600,12 @@ def train_nb(
         f"model_nb_{experiment_id}.pkl"
     )
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Підпапка моделі — туди йде канонічний model.pkl + predictions.json.
+    nb_model_dir = Path(save_path).parent / f"nb_{experiment_id}"
+    nb_model_dir.mkdir(parents=True, exist_ok=True)
+    nb_model_path = nb_model_dir / "model.pkl"
+
     bundle = {
         "pipeline": pipeline,
         "preprocessing": dict(preprocessing),
@@ -614,8 +620,11 @@ def train_nb(
         "additional_features": list(additional_features) if additional_features else [],
         "use_text": use_text,
     }
-    joblib.dump(bundle, save_path)
-    log.info(f"  Saved article-level NB → {save_path}")
+    joblib.dump(bundle, nb_model_path)
+    # Backward-compat: legacy шлях user_X/model_nb_<exp>.pkl
+    import shutil
+    shutil.copy(nb_model_path, save_path)
+    log.info(f"  Saved article-level NB → {nb_model_path} (+ legacy copy {save_path})")
 
     # Save predictions для подальшого використання в ансамблях
     try:
@@ -630,7 +639,7 @@ def train_nb(
         article_ids = df_test["article_id"].astype(str).tolist()
 
         save_predictions(
-            model_dir=Path(save_path).parent,
+            model_dir=nb_model_dir,
             article_ids=article_ids,
             y_true=y_test,
             y_pred=y_pred,
