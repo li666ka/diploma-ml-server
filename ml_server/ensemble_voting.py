@@ -101,43 +101,62 @@ def weighted_vote(
 def _align_members_by_article_id(
     members_data: list[dict],
 ) -> tuple[list[dict], list[str]]:
-    """Узгодити порядок article_ids між членами. Reference — перший член.
+    """Soft-align members на спільні article_ids (intersection).
 
-    Якщо у когось не вистачає article_id з reference — error.
-    Member'ам що мають зайві article_ids — обрізаємо до reference перетину.
+    Замість строгого match — беремо перетин ВСІХ членів. Це дозволяє
+    ансамблювати моделі, тренувалися з різними preprocessing (різні
+    min_text_length, require_tweets тощо). Втрачені article_ids логуються.
     """
-    reference_ids = list(members_data[0]["article_ids"])
+    log.info("Aligning test sets across members...")
 
-    aligned = [members_data[0]]
-    for i, m in enumerate(members_data[1:], 1):
-        member_ids = list(m["article_ids"])
-        if member_ids == reference_ids:
-            aligned.append(m)
-            continue
+    member_id_sets = [set(m["article_ids"]) for m in members_data]
+    member_sizes = [len(s) for s in member_id_sets]
+    log.info(f"Member test sizes: {member_sizes}")
 
-        log.warning(
-            f"Member {i} has different article_ids order. Re-aligning…"
+    common_ids = set.intersection(*member_id_sets)
+    n_common = len(common_ids)
+
+    if n_common == 0:
+        raise ValueError(
+            "No common article_ids across members. "
+            f"Member sizes: {member_sizes}. "
+            "Models tested on completely different data — cannot ensemble."
         )
-        member_map = {aid: idx for idx, aid in enumerate(member_ids)}
-        new_indices: list[int] = []
-        for ref_aid in reference_ids:
-            if ref_aid not in member_map:
-                raise ValueError(
-                    f"Member {i} (model_id={m.get('model_record_id')}) "
-                    f"missing article_id={ref_aid}. Members tested on "
-                    "different test sets."
-                )
-            new_indices.append(member_map[ref_aid])
 
-        new_indices_arr = np.asarray(new_indices, dtype=np.int64)
+    max_member_size = max(member_sizes)
+    loss_pct = (max_member_size - n_common) / max_member_size * 100
+
+    if n_common < max_member_size:
+        log.warning(
+            f"Test sets mismatch detected. "
+            f"Common test set: {n_common}/{max_member_size} "
+            f"({loss_pct:.1f}% reduction). "
+            "Ensemble evaluation на перетині article_ids."
+        )
+    if loss_pct > 20:
+        log.warning(
+            f"HIGH MISMATCH ({loss_pct:.1f}% reduction). "
+            "Consider re-training members with unified preprocessing."
+        )
+
+    reference_ids = sorted(common_ids)
+
+    aligned: list[dict] = []
+    for m in members_data:
+        member_map = {aid: idx for idx, aid in enumerate(m["article_ids"])}
+        new_indices = np.asarray(
+            [member_map[ref_aid] for ref_aid in reference_ids],
+            dtype=np.int64,
+        )
         aligned.append({
             **m,
             "article_ids": reference_ids,
-            "y_true": np.asarray(m["y_true"])[new_indices_arr],
-            "y_pred": np.asarray(m["y_pred"])[new_indices_arr],
-            "y_proba_fake": np.asarray(m["y_proba_fake"])[new_indices_arr],
+            "y_true": np.asarray(m["y_true"])[new_indices],
+            "y_pred": np.asarray(m["y_pred"])[new_indices],
+            "y_proba_fake": np.asarray(m["y_proba_fake"])[new_indices],
         })
 
+    log.info(f"Aligned to {len(reference_ids)} common samples")
     return aligned, reference_ids
 
 

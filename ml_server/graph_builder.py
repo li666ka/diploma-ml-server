@@ -97,19 +97,16 @@ def build_graph_for_article(
             break
         frontier = next_frontier
 
-    # Build tensors
-    if not node_features:
-        x = article_emb.unsqueeze(0)
-        edge_index = torch.empty((2, 0), dtype=torch.long)
+    # Build tensors. Isolated випадок (тільки article, без твітів) — додаємо
+    # self-loop, щоб усі архітектури GNN не падали на 0-edge графах.
+    x = torch.stack(node_features)
+    if edge_src:
+        edge_index = torch.tensor(
+            [edge_src + edge_dst, edge_dst + edge_src],
+            dtype=torch.long,
+        )
     else:
-        x = torch.stack(node_features)
-        if edge_src:
-            edge_index = torch.tensor(
-                [edge_src + edge_dst, edge_dst + edge_src],
-                dtype=torch.long,
-            )
-        else:
-            edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_index = torch.tensor([[0], [0]], dtype=torch.long)
 
     return Data(
         x=x,
@@ -117,7 +114,7 @@ def build_graph_for_article(
         y=torch.tensor([label], dtype=torch.long),
         node_type=torch.tensor(node_types, dtype=torch.long),
         article_id=article_id,
-        num_nodes=len(node_features) if node_features else 1,
+        num_nodes=len(node_features),
     )
 
 
@@ -153,6 +150,7 @@ def build_all_graphs(
         )
 
     graphs = []
+    skipped_no_emb = 0
     log.info(f"Building {len(articles_df):,} graphs...")
 
     for i, row in enumerate(articles_df.itertuples(index=False)):
@@ -160,6 +158,7 @@ def build_all_graphs(
         label = int(row.label)
 
         if article_id not in article_emb_dict:
+            skipped_no_emb += 1
             continue
 
         tweet_ids = tweets_by_article.get(article_id, [])
@@ -186,6 +185,12 @@ def build_all_graphs(
                 progress_callback(f"built_graphs_{i+1}_of_{len(articles_df)}")
             log.info(f"  built {i+1}/{len(articles_df)}")
 
+    if skipped_no_emb:
+        log.warning(
+            f"  SKIPPED {skipped_no_emb} articles without embeddings — "
+            "predictions для них не будуть створені (порушує test-set "
+            "alignment для ensemble). Перетренуйте embedding cache."
+        )
     log.info(f"  Done: {len(graphs):,} graphs")
     return graphs
 

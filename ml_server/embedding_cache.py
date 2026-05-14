@@ -32,6 +32,10 @@ CACHE_ROOT = Path(MODELS_ROOT).parent / "embeddings_cache"
 ENCODER_VERSION = "minilm-v1"
 
 
+class CorruptMemmapCache(Exception):
+    """Cache на диску неконсистентний (ids.json ↔ .npy size mismatch)."""
+
+
 def _cache_dir(dataset_id) -> Path:
     d = CACHE_ROOT / f"dataset_{dataset_id}"
     d.mkdir(parents=True, exist_ok=True)
@@ -457,10 +461,18 @@ def encode_incrementally_memmap(
 
         if cached:
             log.info(f"[{name}] loading from memmap cache...")
-            lookups[name] = MemmapLookup(npy_path, ids_path)
-            cache_hits[name] = "hit"
-            _log_ram(name, "after_cache_hit")
-            continue
+            try:
+                lookups[name] = MemmapLookup(npy_path, ids_path)
+                cache_hits[name] = "hit"
+                _log_ram(name, "after_cache_hit")
+                continue
+            except CorruptMemmapCache as e:
+                log.warning(f"[{name}] {e} — re-encoding from scratch")
+                if npy_path.exists():
+                    npy_path.unlink()
+                if ids_path.exists():
+                    ids_path.unlink()
+                # fall through to re-encoding below
 
         cache_hits[name] = "miss"
 
@@ -538,11 +550,10 @@ def _encode_to_memmap(
 
     id_to_row = {df_clean[id_col].iloc[i]: i for i in range(n_items)}
 
-    tmp_ids = ids_path.with_suffix(".json.tmp")
-    with open(tmp_ids, "w") as f:
-        json.dump(id_to_row, f)
-    tmp_ids.replace(ids_path)
-
+    # ВАЖЛИВО: пишемо .npy ПЕРШИМ і коммітимо ids.json лише після успішного
+    # `tmp_npy.replace(npy_path)`. Це дає атомарну консистентність — якщо
+    # процес впаде під час encoding, або .npy частково записаний, ids.json
+    # залишається старим (або відсутнім), і кеш-перевірка не побачить hit.
     tmp_npy = npy_path.with_suffix(".npy.tmp")
     memmap = np.memmap(
         tmp_npy,
@@ -583,6 +594,12 @@ def _encode_to_memmap(
     gc.collect()
 
     tmp_npy.replace(npy_path)
+
+    # Commit ids.json лише після того, як .npy успішно опинився на диску.
+    tmp_ids = ids_path.with_suffix(".json.tmp")
+    with open(tmp_ids, "w") as f:
+        json.dump(id_to_row, f)
+    tmp_ids.replace(ids_path)
 
     log.info(f"    ✓ memmap saved: {npy_path.name} ({n_items:,} × {EMBEDDING_DIM})")
 
@@ -646,6 +663,14 @@ class MemmapLookup:
             self.id_to_row = json.load(f)
 
         n_items = len(self.id_to_row)
+        expected_bytes = n_items * 384 * 4  # float32
+        actual_bytes = self.npy_path.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise CorruptMemmapCache(
+                f"Memmap cache inconsistent for {self.npy_path.name}: "
+                f"ids.json claims {n_items} items ({expected_bytes} bytes), "
+                f"but .npy is {actual_bytes} bytes. Cache will be rebuilt."
+            )
         self.memmap = np.memmap(
             self.npy_path,
             dtype=np.float32,

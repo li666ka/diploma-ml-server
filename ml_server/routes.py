@@ -30,6 +30,19 @@ from ml_server.upload_handlers import (
 from ml_server.utils import log, preprocess_text
 
 
+# Уніфіковані preprocessing параметри для ВСІХ article-level моделей.
+# Гарантують однаковий test set між NB / DistilBERT / GNN — обов'язково для
+# ensemble compatibility (soft-align зробить fallback intersect, але кращий
+# підхід — однакові тренувальні splits).
+STANDARD_PREPROCESSING = {
+    "test_ratio": 0.15,
+    "val_ratio": 0.15,
+    "min_text_length": 30,
+    "seed": 42,
+    "require_tweets": False,
+}
+
+
 # legacy `train_nb_aggregated` приймає stylistic і rhetorical окремо;
 # після об'єднання у STYLISTIC_FEATURES розділяємо їх локально для роутера.
 _STYLISTIC_PURE = {"caps_ratio", "ttr", "repetition_score", "avg_word_length"}
@@ -386,11 +399,7 @@ def _run_training_impl(payload: dict) -> dict:
             train_df, val_df, test_df, full_data, data_stats, tmpdir = (
                 build_article_level_data(
                     dataset_id=dataset_id, dataset_name=dataset_name,
-                    test_ratio=float(data_params.get("test_ratio", 0.15)),
-                    val_ratio=float(data_params.get("val_ratio", 0.15)),
-                    min_text_length=int(data_params.get("min_text_length", 30)),
-                    seed=int(data_params.get("seed", 42)),
-                    require_tweets=False,
+                    **STANDARD_PREPROCESSING,
                     require_social=needs_social,
                     splits_subdir=splits_subdir,
                 )
@@ -454,11 +463,7 @@ def _run_training_impl(payload: dict) -> dict:
             train_df, val_df, test_df, full_data, data_stats, tmpdir = (
                 build_article_level_data(
                     dataset_id=dataset_id, dataset_name=dataset_name,
-                    test_ratio=float(data_params.get("test_ratio", 0.15)),
-                    val_ratio=float(data_params.get("val_ratio", 0.15)),
-                    min_text_length=int(data_params.get("min_text_length", 30)),
-                    seed=int(data_params.get("seed", 42)),
-                    require_tweets=False,
+                    **STANDARD_PREPROCESSING,
                     splits_subdir=splits_subdir,
                 )
             )
@@ -473,14 +478,16 @@ def _run_training_impl(payload: dict) -> dict:
 
         # ── Branch 3: GNN — article-level + графи ──
         elif model_type == "gnn":
+            # Уніфіковані splits (require_tweets=False) → той самий test set
+            # що й NB/DistilBERT. require_social=True потрібен лише для
+            # завантаження full_data (tweets/retweets/replies); сам test_df
+            # не фільтрується по наявності твітів — статті без них отримують
+            # ізольований 1-вузловий граф (див. build_graph_for_article).
             train_df, val_df, test_df, full_data, data_stats, tmpdir = (
                 build_article_level_data(
                     dataset_id=dataset_id, dataset_name=dataset_name,
-                    test_ratio=float(data_params.get("test_ratio", 0.15)),
-                    val_ratio=float(data_params.get("val_ratio", 0.15)),
-                    min_text_length=int(data_params.get("min_text_length", 30)),
-                    seed=int(data_params.get("seed", 42)),
-                    require_tweets=True,
+                    **STANDARD_PREPROCESSING,
+                    require_social=True,
                     splits_subdir=splits_subdir,
                 )
             )
