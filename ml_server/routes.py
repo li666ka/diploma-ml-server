@@ -68,15 +68,37 @@ def register_routes(app: Flask):
     # ── Health ────────────────────────────────────────────────────────────
     @app.route("/health", methods=["GET"])
     def health():
+        import glob
         import torch
+
+        from ml_server.config import MODELS_ROOT
+
         model, _tokenizer = get_distilbert_state()
         cuda_ok = torch.cuda.is_available()
+        models_root_exists = os.path.isdir(MODELS_ROOT)
+
+        available_distilbert: list[str] = []
+        available_pkl: list[str] = []
+        if models_root_exists:
+            # Каталоги Hugging Face: MODELS_ROOT/user_*/distilbert_*
+            available_distilbert = sorted(
+                glob.glob(os.path.join(MODELS_ROOT, "user_*", "distilbert_*"))
+            )[:20]
+            # .pkl bundles (саме на них вказує ModelRecord.model_path)
+            available_pkl = sorted(
+                glob.glob(os.path.join(MODELS_ROOT, "user_*", "model_*.pkl"))
+            )[:20]
+
         return jsonify({
             "status": "ok",
             "service": "ml_server",
-            "distilbert_loaded": model is not None,
+            "distilbert_in_memory": model is not None,
             "cuda_available": cuda_ok,
             "device": "cuda" if cuda_ok else "cpu",
+            "models_root": str(MODELS_ROOT),
+            "models_root_exists": models_root_exists,
+            "available_distilbert_dirs": available_distilbert,
+            "available_pkl_bundles": available_pkl,
         })
 
     # ── Dataset management ────────────────────────────────────────────────
@@ -226,28 +248,82 @@ def register_routes(app: Flask):
 
         # ── 2. Lazy load з model_path якщо global state втрачено ────────
         # Сценарій: Colab runtime restart → globals скинулись, але файли
-        # моделі лежать у /content/models/<user>/distilbert_<exp>/.
-        # FastAPI вже передає model_path з ModelRecord.model_path —
-        # використовуємо його як fallback.
+        # моделі лежать у MODELS_ROOT/user_X/distilbert_<exp>/.
+        # ModelRecord.model_path вказує на .pkl bundle, який містить
+        # {"type":"distilbert", "model_dir": "...", "model_name": ..., "max_length": 256}.
+        # AutoModel.from_pretrained() на .pkl падає ("Repo id must be in the form ..."),
+        # тому спершу розпаковуємо bundle і отримуємо реальну HF-директорію.
         if model is None and model_path:
+            import joblib
+            from pathlib import Path as _Path
+
             try:
+                if model_path.endswith(".pkl"):
+                    if not os.path.exists(model_path):
+                        return jsonify({
+                            "error": "pkl_not_found",
+                            "model_path": model_path,
+                            "message": "Bundle .pkl file not found on disk",
+                        }), 404
+                    bundle = joblib.load(model_path)
+                    if not isinstance(bundle, dict) or bundle.get("type") != "distilbert":
+                        return jsonify({
+                            "error": "wrong_model_type",
+                            "expected": "distilbert",
+                            "got": bundle.get("type") if isinstance(bundle, dict) else "non-dict",
+                            "hint": "This .pkl is not a DistilBERT bundle",
+                        }), 400
+                    model_dir = bundle.get("model_dir")
+                    if not model_dir:
+                        return jsonify({
+                            "error": "missing_model_dir",
+                            "message": ".pkl bundle has no 'model_dir' field",
+                        }), 500
+                else:
+                    # model_path вже вказує безпосередньо на HF-директорію.
+                    model_dir = model_path
+
+                if not os.path.isdir(model_dir):
+                    return jsonify({
+                        "error": "model_dir_not_found",
+                        "model_dir": model_dir,
+                        "hint": (
+                            "Directory was on local Colab disk and lost on runtime "
+                            "restart. Re-train the model or save to Google Drive."
+                        ),
+                    }), 404
+
+                # Перевірити що HF weights присутні (інакше from_pretrained кине
+                # незрозумілий KeyError всередині transformers).
+                required_any = ["model.safetensors", "pytorch_model.bin"]
+                if not any((_Path(model_dir) / f).exists() for f in required_any):
+                    return jsonify({
+                        "error": "incomplete_model_dir",
+                        "model_dir": model_dir,
+                        "message": f"None of {required_any} found in directory",
+                    }), 500
+
                 from transformers import (
                     AutoModelForSequenceClassification,
                     AutoTokenizer,
                 )
-                log.info(f"Lazy loading DistilBERT from {model_path}")
-                model = AutoModelForSequenceClassification.from_pretrained(model_path)
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                log.info(f"Lazy loading DistilBERT from directory: {model_dir}")
+                model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+                tokenizer = AutoTokenizer.from_pretrained(model_dir)
                 if torch.cuda.is_available():
                     model = model.to("cuda")
                 model.eval()
                 set_distilbert_state(model, tokenizer)
+                log.info("DistilBERT loaded and cached in global state")
             except Exception as e:
-                log.error(f"Lazy load failed for {model_path}: {e}")
+                import traceback
+                tb = traceback.format_exc()
+                log.error(f"DistilBERT lazy load failed: {e}\n{tb}")
                 return jsonify({
                     "error": "model_load_failed",
                     "model_path": model_path,
                     "message": str(e),
+                    "traceback": tb.splitlines()[-10:],
                 }), 500
 
         if model is None:
