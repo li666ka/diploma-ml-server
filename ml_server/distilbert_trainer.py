@@ -36,6 +36,15 @@ def get_distilbert_state():
     return _distilbert_model, _distilbert_tokenizer
 
 
+def set_distilbert_state(model, tokenizer) -> None:
+    """Populate inference cache (used by lazy-load шлях у routes.predict_distilbert
+    після Colab runtime restart, коли тренувальний global state втрачено, але
+    файли моделі лежать у model_path)."""
+    global _distilbert_model, _distilbert_tokenizer
+    _distilbert_model = model
+    _distilbert_tokenizer = tokenizer
+
+
 def train_distilbert_article_level(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,

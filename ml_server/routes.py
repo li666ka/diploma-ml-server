@@ -11,6 +11,7 @@ from ml_server.aggregated_loader import build_aggregated_data
 from ml_server.data_loader import build_article_level_data
 from ml_server.distilbert_trainer import (
     get_distilbert_state,
+    set_distilbert_state,
     train_distilbert_article_level,
 )
 from ml_server.features import (
@@ -67,7 +68,16 @@ def register_routes(app: Flask):
     # ── Health ────────────────────────────────────────────────────────────
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "ok", "service": "ml_server"})
+        import torch
+        model, _tokenizer = get_distilbert_state()
+        cuda_ok = torch.cuda.is_available()
+        return jsonify({
+            "status": "ok",
+            "service": "ml_server",
+            "distilbert_loaded": model is not None,
+            "cuda_available": cuda_ok,
+            "device": "cuda" if cuda_ok else "cpu",
+        })
 
     # ── Dataset management ────────────────────────────────────────────────
     @app.route("/list_datasets", methods=["GET"])
@@ -199,10 +209,55 @@ def register_routes(app: Flask):
 
         data = request.json or {}
         text = data.get("text", "") or data.get("article_text", "")
+        model_path = data.get("model_path")
+
+        # ── 1. Empty-text перевірка окремо від model-loaded ─────────────
+        # Раніше обидві умови повертали однакову помилку — це маскувало
+        # реальну причину 400 (FE не міг розрізнити "extractor повернув ''"
+        # від "модель не завантажена після Colab restart").
+        if not text or not text.strip():
+            return jsonify({
+                "error": "empty_text",
+                "message": "Text is empty or whitespace-only",
+                "hint": "Check that extracted claim is not empty before sending",
+            }), 400
 
         model, tokenizer = get_distilbert_state()
-        if not text or model is None:
-            return jsonify({"error": "DistilBERT model not loaded or empty text"}), 400
+
+        # ── 2. Lazy load з model_path якщо global state втрачено ────────
+        # Сценарій: Colab runtime restart → globals скинулись, але файли
+        # моделі лежать у /content/models/<user>/distilbert_<exp>/.
+        # FastAPI вже передає model_path з ModelRecord.model_path —
+        # використовуємо його як fallback.
+        if model is None and model_path:
+            try:
+                from transformers import (
+                    AutoModelForSequenceClassification,
+                    AutoTokenizer,
+                )
+                log.info(f"Lazy loading DistilBERT from {model_path}")
+                model = AutoModelForSequenceClassification.from_pretrained(model_path)
+                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+                model.eval()
+                set_distilbert_state(model, tokenizer)
+            except Exception as e:
+                log.error(f"Lazy load failed for {model_path}: {e}")
+                return jsonify({
+                    "error": "model_load_failed",
+                    "model_path": model_path,
+                    "message": str(e),
+                }), 500
+
+        if model is None:
+            return jsonify({
+                "error": "model_not_loaded",
+                "message": (
+                    "No DistilBERT model in memory and no model_path provided"
+                ),
+                "hint": "Train a model first or provide model_path in payload",
+            }), 400
 
         light_opts = {"removeUrls": True, "removeMentions": True, "cleaning": True}
         processed = preprocess_text(text, light_opts)
