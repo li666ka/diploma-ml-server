@@ -949,11 +949,23 @@ def register_routes(app: Flask):
         from ml_server.graph_builder import build_inference_graph
 
         data = request.json or {}
-        article_text = data.get("article_text", "")
-        tweets_input = data.get("tweets", [])
-        retweets_input = data.get("retweets", [])
-        replies_input = data.get("replies", [])
         model_path = data.get("model_path")
+        explain = bool(data.get("explain", False))
+
+        # Phase 2: підтримуємо nested `graph_inputs` payload з FastAPI
+        # InferenceContextBuilder. Backward-compat — лишаємо top-level
+        # article_text/tweets/retweets/replies як раніше.
+        graph_inputs = data.get("graph_inputs")
+        if graph_inputs:
+            article_text = graph_inputs.get("article_text", "")
+            tweets_input = graph_inputs.get("tweets", []) or []
+            retweets_input = graph_inputs.get("retweets", []) or []
+            replies_input = graph_inputs.get("replies", []) or []
+        else:
+            article_text = data.get("article_text", "")
+            tweets_input = data.get("tweets", []) or []
+            retweets_input = data.get("retweets", []) or []
+            replies_input = data.get("replies", []) or []
 
         if not article_text:
             return jsonify({"error": "article_text required"}), 400
@@ -1014,15 +1026,39 @@ def register_routes(app: Flask):
                 probs = F.softmax(logits, dim=1)[0].cpu().numpy()
 
             pred = int(probs.argmax())
-            return jsonify({
+            response = {
                 "label": "FAKE" if pred == 1 else "REAL",
                 "confidence": float(probs[pred]),
                 "proba_fake": float(probs[1]),
                 "proba_real": float(probs[0]),
-                "graph_size": int(graph_data.num_nodes),
-                "graph_edges": int(graph_data.edge_index.shape[1] // 2),
+                "probability": float(probs[1]),  # alias для FastAPI uniformity
+                "graph_stats": {
+                    "n_nodes": int(graph_data.num_nodes),
+                    "n_edges": int(graph_data.edge_index.shape[1]),
+                },
+                "graph_size": int(graph_data.num_nodes),  # legacy
+                "graph_edges": int(graph_data.edge_index.shape[1] // 2),  # legacy
                 "architecture": architecture,
-            })
+            }
+            # Inline GNNExplainer (1 round-trip) — використовує існуючий
+            # ml_server/explainer_gnn.py (з попередньої задачі)
+            if explain:
+                try:
+                    from ml_server.explainer_gnn import explain_gnn
+                    response["explanation"] = explain_gnn(
+                        graph_data, model,
+                        top_k_nodes=10, top_k_edges=15, epochs=100,
+                    )
+                except ImportError as e:
+                    response["explanation_error"] = (
+                        f"GNNExplainer unavailable: {e}. "
+                        "pip install torch_geometric>=2.4"
+                    )
+                except Exception as e:
+                    import traceback
+                    log.error(f"GNN explain failed: {e}\n{traceback.format_exc()}")
+                    response["explanation_error"] = str(e)[:300]
+            return jsonify(response)
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
