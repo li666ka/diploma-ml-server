@@ -550,9 +550,10 @@ def register_routes(app: Flask):
             from ml_server.explainer_distilbert import explain_distilbert
         except ImportError as e:
             return jsonify({
-                "error": "captum_unavailable",
-                "message": f"captum not installed: {e}",
-                "hint": "Run in Colab cell: !pip install captum --quiet",
+                "error": "captum_not_installed",
+                "message": "Run: pip install captum",
+                "hint": "У Colab cell: !pip install -r requirements.txt (потім Runtime → Restart current cell)",
+                "details": str(e),
             }), 500
 
         try:
