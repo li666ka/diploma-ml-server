@@ -44,23 +44,71 @@ _GNN_EXPLAIN_TTL = 300.0  # секунд
 _NB_PIPELINE_CACHE: dict = {}
 
 
-def _nb_build_input(pipeline, processed_text: str, add_feat_cols: list[str]):
-    """Підготувати input для NB pipeline (use_text=True вже гарантовано).
+def _detect_nb_mode(pipeline) -> str:
+    """Authoritative детектор Mode за фактичним типом першого pipeline-кроку.
 
-    Mode A (no additional_features): plain [text] для TfidfVectorizer.
-    Mode B (з additional_features): DataFrame з 'text_processed' + numeric
-        cols (= 0 для single-text inference). Реальні значення фіч ми не
-        обчислюємо тут — це наближення, але без падіння.
+    Метадані bundle (`use_text`, `additional_features`) могли збреху́ти у
+    legacy-моделях, тому покладаємось на структуру самого pipeline:
+
+      Mode A: перший step — text-vectorizer (TfidfVectorizer, CountVectorizer)
+              → приймає list[str].
+      Mode B: перший step — ColumnTransformer → потрібен DataFrame з
+              текстовою + numeric колонками.
+      Mode C: усе інше (MinMaxScaler, StandardScaler, etc.) → numeric only.
     """
-    if not add_feat_cols:
-        return [processed_text]
+    from sklearn.compose import ColumnTransformer
 
-    import pandas as pd
+    if not getattr(pipeline, "steps", None):
+        return "unknown"
+    first = pipeline.steps[0][1]
+    if isinstance(first, ColumnTransformer):
+        return "B"
+    # vectorizer-like: fitted має vocabulary_; також ловимо за class name
+    cname = type(first).__name__.lower()
+    if hasattr(first, "vocabulary_") or "vectorizer" in cname:
+        return "A"
+    return "C"
 
-    row: dict = {"text_processed": processed_text}
-    for col in add_feat_cols:
-        row[col] = 0.0
-    return pd.DataFrame([row])
+
+def _extract_feature_cols_from_ct(ct) -> list[str]:
+    """ColumnTransformer.transformers_ → list of numeric feature column names."""
+    cols: list[str] = []
+    for _name, _transformer, c in getattr(ct, "transformers_", []):
+        if isinstance(c, (list, tuple)):
+            cols.extend(str(x) for x in c)
+    return cols
+
+
+def _nb_build_input(pipeline, processed_text: str, add_feat_cols: list[str]):
+    """Підготувати input для NB pipeline. Mode визначається з СТРУКТУРИ
+    pipeline (а не з bundle metadata)."""
+    mode = _detect_nb_mode(pipeline)
+
+    if mode == "A":
+        return [processed_text], mode
+
+    if mode == "B":
+        import pandas as pd
+        from sklearn.compose import ColumnTransformer
+
+        # Якщо bundle не зберіг add_feat_cols (legacy), дістаємо з самого CT.
+        ct: ColumnTransformer = pipeline.steps[0][1]
+        if not add_feat_cols:
+            add_feat_cols = _extract_feature_cols_from_ct(ct)
+        # text-колонку шукаємо у transformers_ — щоб не покладатись на
+        # хардкод "text_processed".
+        text_col = "text_processed"
+        for _n, _t, c in getattr(ct, "transformers_", []):
+            if isinstance(c, str):
+                text_col = c
+                break
+        row: dict = {text_col: processed_text}
+        for col in add_feat_cols:
+            row[col] = 0.0
+        return pd.DataFrame([row]), mode
+
+    # Mode C — caller має сам повернути 400; повертаємо None як сигнал
+    return None, mode
 
 
 # ── DistilBERT lazy-load helper ─────────────────────────────────────────
@@ -528,29 +576,26 @@ def register_routes(app: Flask):
                     ),
                 }), 400
 
-            # Article-level NB може бути:
-            #   Mode A — Pipeline([vectorizer, classifier]) — text-only,
-            #            predict_proba(["text"]) працює.
-            #   Mode B — Pipeline([preprocessor=ColumnTransformer, classifier])
-            #            — потрібен DataFrame з 'text_processed' + feature cols.
-            #            Single-text inference: features=0 (не маємо їх).
-            #   Mode C — features only (use_text=False, first step — MinMaxScaler).
-            #            Single-text inference неможливий.
-            use_text = cached["use_text"]
-            add_feat_cols = cached["additional_features"]
-
-            if not use_text:
-                # Mode C — без text, передавати немає що.
+            # Article-level NB Mode визначається з фактичної структури
+            # pipeline.steps[0] (метадані bundle ненадійні у legacy моделях):
+            #   Mode A — Vectorizer first → [text]
+            #   Mode B — ColumnTransformer first → DataFrame з text + feat=0
+            #   Mode C — Scaler first → single-text inference неможливий
+            X, mode = _nb_build_input(
+                pipeline, processed, cached["additional_features"]
+            )
+            if mode == "C" or X is None:
                 return jsonify({
                     "error": "features_required",
                     "message": (
-                        "Ця NB модель тренувалась на features-only "
-                        "(use_text=False); single-text inference неможливий."
+                        "Ця NB модель — features-only (pipeline починається "
+                        "зі scaler-step, без text-vectorizer). Single-text "
+                        "inference неможливий."
                     ),
-                    "additional_features": add_feat_cols,
+                    "first_step_type": type(pipeline.steps[0][1]).__name__,
+                    "additional_features": cached["additional_features"],
                 }), 400
-
-            X = _nb_build_input(pipeline, processed, add_feat_cols)
+            log.info(f"NB predict mode={mode} model={model_path}")
 
             try:
                 proba = pipeline.predict_proba(X)[0]
