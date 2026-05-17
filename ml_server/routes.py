@@ -734,6 +734,46 @@ def register_routes(app: Flask):
                 "traceback": tb.splitlines()[-10:],
             }), 500
 
+    @app.route("/explain_nb", methods=["POST"])
+    def explain_nb_route():
+        """Local explanation для NB через log-odds per token / feature.
+
+        Payload: {text, model_path, feature_values?: dict}.
+        Mode A/B повертає `tokens`; Mode B/C повертає `feature_attributions`.
+        """
+        data = request.json or {}
+        text = data.get("text", "") or ""
+        model_path = data.get("model_path")
+        feature_values = data.get("feature_values")
+
+        if not text.strip():
+            return jsonify({"error": "empty_text"}), 400
+        if not model_path:
+            return jsonify({"error": "model_path_required"}), 400
+        if not os.path.exists(model_path):
+            return jsonify({
+                "error": "model_not_found",
+                "model_path": model_path,
+            }), 404
+
+        try:
+            from ml_server.explainer_nb import explain_nb_prediction
+            result = explain_nb_prediction(
+                model_path=model_path,
+                text=text,
+                feature_values=feature_values,
+            )
+            return jsonify(result)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error(f"NB explain failed: {e}\n{tb}")
+            return jsonify({
+                "error": "explain_failed",
+                "message": str(e),
+                "traceback": tb.splitlines()[-15:],
+            }), 500
+
     @app.route("/explain_gnn", methods=["POST"])
     def explain_gnn_route():
         """GNNExplainer для article-level classification (GIN/SAGE).
