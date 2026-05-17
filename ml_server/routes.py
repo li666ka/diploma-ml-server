@@ -31,6 +31,105 @@ from ml_server.upload_handlers import (
 from ml_server.utils import log, preprocess_text
 
 
+# ── GNNExplainer in-memory LRU cache ────────────────────────────────────
+# GNNExplainer повільний (5-15s GPU, до 60s CPU), а одна стаття часто
+# explain'иться кілька разів підряд з UI. Кеш на 16 свіжих результатів,
+# TTL 5 хв.
+_GNN_EXPLAIN_CACHE: dict = {}
+_GNN_EXPLAIN_TTL = 300.0  # секунд
+
+
+# ── DistilBERT lazy-load helper ─────────────────────────────────────────
+# Спільний для /predict_distilbert та /explain_distilbert. Повертає
+# (model, tokenizer, error_tuple). На успіх error_tuple == None; на провал —
+# готовий (jsonify-dict, http_code) для прямого return з view-функції.
+
+def _ensure_distilbert_loaded(model_path):
+    """Lazy-load DistilBERT із .pkl bundle або HF директорії."""
+    import torch
+
+    model, tokenizer = get_distilbert_state()
+    if model is not None:
+        return model, tokenizer, None
+
+    if not model_path:
+        return None, None, (jsonify({
+            "error": "model_not_loaded",
+            "message": "No DistilBERT model in memory and no model_path provided",
+            "hint": "Train a model first or provide model_path in payload",
+        }), 400)
+
+    import joblib
+    from pathlib import Path as _Path
+
+    try:
+        if model_path.endswith(".pkl"):
+            if not os.path.exists(model_path):
+                return None, None, (jsonify({
+                    "error": "pkl_not_found",
+                    "model_path": model_path,
+                    "message": "Bundle .pkl file not found on disk",
+                }), 404)
+            bundle = joblib.load(model_path)
+            if not isinstance(bundle, dict) or bundle.get("type") != "distilbert":
+                return None, None, (jsonify({
+                    "error": "wrong_model_type",
+                    "expected": "distilbert",
+                    "got": bundle.get("type") if isinstance(bundle, dict) else "non-dict",
+                    "hint": "This .pkl is not a DistilBERT bundle",
+                }), 400)
+            model_dir = bundle.get("model_dir")
+            if not model_dir:
+                return None, None, (jsonify({
+                    "error": "missing_model_dir",
+                    "message": ".pkl bundle has no 'model_dir' field",
+                }), 500)
+        else:
+            model_dir = model_path
+
+        if not os.path.isdir(model_dir):
+            return None, None, (jsonify({
+                "error": "model_dir_not_found",
+                "model_dir": model_dir,
+                "hint": (
+                    "Directory was on local Colab disk and lost on runtime "
+                    "restart. Re-train the model or save to Google Drive."
+                ),
+            }), 404)
+
+        required_any = ["model.safetensors", "pytorch_model.bin"]
+        if not any((_Path(model_dir) / f).exists() for f in required_any):
+            return None, None, (jsonify({
+                "error": "incomplete_model_dir",
+                "model_dir": model_dir,
+                "message": f"None of {required_any} found in directory",
+            }), 500)
+
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+        )
+        log.info(f"Lazy loading DistilBERT from directory: {model_dir}")
+        model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        if torch.cuda.is_available():
+            model = model.to("cuda")
+        model.eval()
+        set_distilbert_state(model, tokenizer)
+        log.info("DistilBERT loaded and cached in global state")
+        return model, tokenizer, None
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"DistilBERT lazy load failed: {e}\n{tb}")
+        return None, None, (jsonify({
+            "error": "model_load_failed",
+            "model_path": model_path,
+            "message": str(e),
+            "traceback": tb.splitlines()[-10:],
+        }), 500)
+
+
 # Уніфіковані preprocessing параметри для ВСІХ article-level моделей.
 # Гарантують однаковий test set між NB / DistilBERT / GNN — обов'язково для
 # ensemble compatibility (soft-align зробить fallback intersect, але кращий
@@ -244,96 +343,11 @@ def register_routes(app: Flask):
                 "hint": "Check that extracted claim is not empty before sending",
             }), 400
 
-        model, tokenizer = get_distilbert_state()
-
-        # ── 2. Lazy load з model_path якщо global state втрачено ────────
-        # Сценарій: Colab runtime restart → globals скинулись, але файли
-        # моделі лежать у MODELS_ROOT/user_X/distilbert_<exp>/.
-        # ModelRecord.model_path вказує на .pkl bundle, який містить
-        # {"type":"distilbert", "model_dir": "...", "model_name": ..., "max_length": 256}.
-        # AutoModel.from_pretrained() на .pkl падає ("Repo id must be in the form ..."),
-        # тому спершу розпаковуємо bundle і отримуємо реальну HF-директорію.
-        if model is None and model_path:
-            import joblib
-            from pathlib import Path as _Path
-
-            try:
-                if model_path.endswith(".pkl"):
-                    if not os.path.exists(model_path):
-                        return jsonify({
-                            "error": "pkl_not_found",
-                            "model_path": model_path,
-                            "message": "Bundle .pkl file not found on disk",
-                        }), 404
-                    bundle = joblib.load(model_path)
-                    if not isinstance(bundle, dict) or bundle.get("type") != "distilbert":
-                        return jsonify({
-                            "error": "wrong_model_type",
-                            "expected": "distilbert",
-                            "got": bundle.get("type") if isinstance(bundle, dict) else "non-dict",
-                            "hint": "This .pkl is not a DistilBERT bundle",
-                        }), 400
-                    model_dir = bundle.get("model_dir")
-                    if not model_dir:
-                        return jsonify({
-                            "error": "missing_model_dir",
-                            "message": ".pkl bundle has no 'model_dir' field",
-                        }), 500
-                else:
-                    # model_path вже вказує безпосередньо на HF-директорію.
-                    model_dir = model_path
-
-                if not os.path.isdir(model_dir):
-                    return jsonify({
-                        "error": "model_dir_not_found",
-                        "model_dir": model_dir,
-                        "hint": (
-                            "Directory was on local Colab disk and lost on runtime "
-                            "restart. Re-train the model or save to Google Drive."
-                        ),
-                    }), 404
-
-                # Перевірити що HF weights присутні (інакше from_pretrained кине
-                # незрозумілий KeyError всередині transformers).
-                required_any = ["model.safetensors", "pytorch_model.bin"]
-                if not any((_Path(model_dir) / f).exists() for f in required_any):
-                    return jsonify({
-                        "error": "incomplete_model_dir",
-                        "model_dir": model_dir,
-                        "message": f"None of {required_any} found in directory",
-                    }), 500
-
-                from transformers import (
-                    AutoModelForSequenceClassification,
-                    AutoTokenizer,
-                )
-                log.info(f"Lazy loading DistilBERT from directory: {model_dir}")
-                model = AutoModelForSequenceClassification.from_pretrained(model_dir)
-                tokenizer = AutoTokenizer.from_pretrained(model_dir)
-                if torch.cuda.is_available():
-                    model = model.to("cuda")
-                model.eval()
-                set_distilbert_state(model, tokenizer)
-                log.info("DistilBERT loaded and cached in global state")
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                log.error(f"DistilBERT lazy load failed: {e}\n{tb}")
-                return jsonify({
-                    "error": "model_load_failed",
-                    "model_path": model_path,
-                    "message": str(e),
-                    "traceback": tb.splitlines()[-10:],
-                }), 500
-
-        if model is None:
-            return jsonify({
-                "error": "model_not_loaded",
-                "message": (
-                    "No DistilBERT model in memory and no model_path provided"
-                ),
-                "hint": "Train a model first or provide model_path in payload",
-            }), 400
+        # ── 2. Lazy load (винесено у _ensure_distilbert_loaded — reused
+        # також у /explain_distilbert) ───────────────────────────────────
+        model, tokenizer, err = _ensure_distilbert_loaded(model_path)
+        if err is not None:
+            return err
 
         light_opts = {"removeUrls": True, "removeMentions": True, "cleaning": True}
         processed = preprocess_text(text, light_opts)
@@ -356,6 +370,203 @@ def register_routes(app: Flask):
             "proba_fake": float(proba[1]),
             "proba_real": float(proba[0]),
         })
+
+    @app.route("/explain_distilbert", methods=["POST"])
+    def explain_distilbert_route():
+        """Local explanation для DistilBERT через Layer Integrated Gradients.
+
+        Payload: {text, model_path?, n_steps?=30, max_length?=256}.
+        Reuses _ensure_distilbert_loaded → ті самі error codes що /predict_distilbert.
+        """
+        data = request.json or {}
+        text = data.get("text", "") or ""
+        model_path = data.get("model_path")
+        n_steps = int(data.get("n_steps", 30))
+        max_length = int(data.get("max_length", 256))
+
+        if not text.strip():
+            return jsonify({
+                "error": "empty_text",
+                "message": "Text is empty or whitespace-only",
+            }), 400
+
+        model, tokenizer, err = _ensure_distilbert_loaded(model_path)
+        if err is not None:
+            return err
+
+        try:
+            from ml_server.explainer_distilbert import explain_distilbert
+        except ImportError as e:
+            return jsonify({
+                "error": "captum_unavailable",
+                "message": f"captum not installed: {e}",
+                "hint": "Run in Colab cell: !pip install captum --quiet",
+            }), 500
+
+        try:
+            result = explain_distilbert(
+                text, model, tokenizer,
+                max_length=max_length, n_steps=n_steps,
+            )
+            return jsonify(result)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error(f"IG explain failed: {e}\n{tb}")
+            return jsonify({
+                "error": "explain_failed",
+                "message": str(e),
+                "traceback": tb.splitlines()[-10:],
+            }), 500
+
+    @app.route("/explain_gnn", methods=["POST"])
+    def explain_gnn_route():
+        """GNNExplainer для article-level classification (GIN/SAGE).
+
+        Payload — той самий, що для /predict_gnn: article_text, tweets[],
+        retweets[], replies[], model_path. Опціонально: epochs, top_k_nodes,
+        top_k_edges.
+
+        Cached 5хв за (model_path, hash payload) — GNNExplainer повільний
+        (5-15s GPU, до 60s CPU).
+        """
+        import hashlib
+        import json as _json
+        import time
+        import joblib
+        import torch
+
+        from ml_server.gnn_models import build_gnn_model
+        from ml_server.graph_builder import build_inference_graph
+
+        data = request.json or {}
+        article_text = data.get("article_text", "") or ""
+        tweets_input = data.get("tweets", []) or []
+        retweets_input = data.get("retweets", []) or []
+        replies_input = data.get("replies", []) or []
+        model_path = data.get("model_path")
+        epochs = int(data.get("epochs", 200))
+        top_k_nodes = int(data.get("top_k_nodes", 10))
+        top_k_edges = int(data.get("top_k_edges", 15))
+        target_class = data.get("target_class")
+        target_class = int(target_class) if target_class is not None else None
+
+        if not article_text.strip():
+            return jsonify({"error": "empty_text", "message": "article_text required"}), 400
+        if not model_path or not os.path.exists(model_path):
+            return jsonify({
+                "error": "model_not_found",
+                "model_path": model_path,
+            }), 404
+
+        # ── Cache lookup ──────────────────────────────────────────────
+        payload_canonical = _json.dumps({
+            "article_text": article_text,
+            "tweets": tweets_input,
+            "retweets": retweets_input,
+            "replies": replies_input,
+            "epochs": epochs,
+            "top_k_nodes": top_k_nodes,
+            "top_k_edges": top_k_edges,
+            "target_class": target_class,
+        }, sort_keys=True, ensure_ascii=False)
+        cache_key = (
+            model_path,
+            hashlib.sha1(payload_canonical.encode("utf-8")).hexdigest(),
+        )
+        cached = _GNN_EXPLAIN_CACHE.get(cache_key)
+        if cached is not None and (time.time() - cached["t"]) < _GNN_EXPLAIN_TTL:
+            log.info("explain_gnn cache hit")
+            return jsonify({**cached["result"], "cached": True})
+
+        # ── Backward-compat normalization для replies (як у /predict_gnn) ──
+        normalized_replies = []
+        for rp in replies_input:
+            if "parent_tweet_idx" in rp or "parent_reply_idx" in rp:
+                normalized_replies.append(rp)
+                continue
+            parent_idx = rp.get("parent_idx")
+            parent_type = rp.get("parent_type", "tweet")
+            new_rp = {"text": rp.get("text", "")}
+            if parent_idx is not None:
+                if parent_type == "reply":
+                    new_rp["parent_reply_idx"] = parent_idx
+                else:
+                    new_rp["parent_tweet_idx"] = parent_idx
+            normalized_replies.append(new_rp)
+
+        try:
+            meta = joblib.load(model_path)
+            if meta.get("type") != "gnn":
+                return jsonify({
+                    "error": "wrong_model_type",
+                    "expected": "gnn",
+                    "got": meta.get("type"),
+                }), 400
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = build_gnn_model(
+                architecture=meta["architecture"],
+                in_dim=meta["in_dim"],
+                hidden_dim=meta["hidden_dim"],
+                dropout=meta["dropout"],
+                num_layers=meta.get("num_layers", 3),
+                pooling=meta.get("pooling"),
+                aggregator=meta.get("aggregator", "mean"),
+            ).to(device)
+            model.load_state_dict(torch.load(
+                meta["best_model_path"], map_location=device, weights_only=True
+            ))
+            model.eval()
+
+            graph_data = build_inference_graph(
+                article_text=article_text,
+                tweets_input=tweets_input,
+                retweets_input=retweets_input,
+                replies_input=normalized_replies,
+            ).to(device)
+
+            from ml_server.explainer_gnn import (
+                build_node_metadata,
+                explain_gnn,
+            )
+            node_metadata = build_node_metadata(
+                article_text=article_text,
+                tweets_input=tweets_input,
+                retweets_input=retweets_input,
+                replies_input=normalized_replies,
+            )
+            result = explain_gnn(
+                graph_data, model,
+                target_class=target_class,
+                top_k_nodes=top_k_nodes,
+                top_k_edges=top_k_edges,
+                epochs=epochs,
+                node_metadata=node_metadata,
+            )
+            result["architecture"] = meta["architecture"]
+
+            # Cache (з простим LRU evict коли > 16 записів)
+            if len(_GNN_EXPLAIN_CACHE) >= 16:
+                _GNN_EXPLAIN_CACHE.pop(next(iter(_GNN_EXPLAIN_CACHE)))
+            _GNN_EXPLAIN_CACHE[cache_key] = {"t": time.time(), "result": result}
+
+            return jsonify({**result, "cached": False})
+        except ImportError as e:
+            return jsonify({
+                "error": "torch_geometric_unavailable",
+                "message": f"torch_geometric / Explain API not available: {e}",
+                "hint": "Run in Colab: !pip install torch_geometric --quiet",
+            }), 500
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error(f"GNN explain failed: {e}\n{tb}")
+            return jsonify({
+                "error": "explain_failed",
+                "message": str(e),
+                "traceback": tb.splitlines()[-10:],
+            }), 500
 
     @app.route("/predict_gnn", methods=["POST"])
     def predict_gnn():
