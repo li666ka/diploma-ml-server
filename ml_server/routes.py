@@ -38,6 +38,11 @@ from ml_server.utils import log, preprocess_text
 _GNN_EXPLAIN_CACHE: dict = {}
 _GNN_EXPLAIN_TTL = 300.0  # секунд
 
+# ── NB pipeline LRU cache ───────────────────────────────────────────────
+# joblib.load з Drive ~1-2s — небажано на кожен /predict_nb. Сам pipeline
+# 1-2 МБ, легко кешуємо 16 свіжих.
+_NB_PIPELINE_CACHE: dict = {}
+
 
 # ── DistilBERT lazy-load helper ─────────────────────────────────────────
 # Спільний для /predict_distilbert та /explain_distilbert. Повертає
@@ -415,6 +420,114 @@ def register_routes(app: Flask):
             log.error(f"IG explain failed: {e}\n{tb}")
             return jsonify({
                 "error": "explain_failed",
+                "message": str(e),
+                "traceback": tb.splitlines()[-10:],
+            }), 500
+
+    @app.route("/predict_nb", methods=["POST"])
+    def predict_nb():
+        """Inference для NB bundle (joblib pickle з `pipeline`).
+
+        Payload: {text, model_path}. model_path вказує на .pkl bundle
+        створений `nb_trainer.train_nb` ({type:"nb", pipeline, pipeline_type,
+        preprocessing, ...}). Кеш по model_path (sklearn pipelines дешеві,
+        але joblib.load з Drive — ~1-2s).
+
+        Без model_path → 400: NB лежить на Drive, server не має fallback
+        без явного шляху.
+        """
+        import joblib
+
+        from ml_server.utils import preprocess_text
+
+        data = request.json or {}
+        text = data.get("text", "") or ""
+        model_path = data.get("model_path")
+
+        if not text.strip():
+            return jsonify({
+                "error": "empty_text",
+                "message": "Text is empty or whitespace-only",
+            }), 400
+        if not model_path:
+            return jsonify({
+                "error": "model_path_required",
+                "message": "NB inference потребує model_path до .pkl bundle",
+            }), 400
+        if not os.path.exists(model_path):
+            return jsonify({
+                "error": "pkl_not_found",
+                "model_path": model_path,
+            }), 404
+
+        try:
+            cached = _NB_PIPELINE_CACHE.get(model_path)
+            if cached is None:
+                bundle = joblib.load(model_path)
+                if not isinstance(bundle, dict) or bundle.get("type") != "nb":
+                    return jsonify({
+                        "error": "wrong_model_type",
+                        "expected": "nb",
+                        "got": bundle.get("type") if isinstance(bundle, dict) else "non-dict",
+                    }), 400
+                pipeline = bundle.get("pipeline")
+                if pipeline is None:
+                    return jsonify({
+                        "error": "missing_pipeline",
+                        "message": "NB bundle has no 'pipeline' field",
+                    }), 500
+                preprocessing = bundle.get("preprocessing") or {}
+                pipeline_type = bundle.get("pipeline_type", "article")
+                cached = {
+                    "pipeline": pipeline,
+                    "preprocessing": preprocessing,
+                    "pipeline_type": pipeline_type,
+                }
+                if len(_NB_PIPELINE_CACHE) >= 16:
+                    _NB_PIPELINE_CACHE.pop(next(iter(_NB_PIPELINE_CACHE)))
+                _NB_PIPELINE_CACHE[model_path] = cached
+                log.info(f"Lazy loaded NB bundle: {model_path}")
+
+            pipeline = cached["pipeline"]
+            processed = preprocess_text(text, cached["preprocessing"]) or text
+
+            # Aggregated NB pipeline хоче DataFrame з фічами — для one-shot
+            # inference без cascade-features це не підтримуємо тут.
+            if cached["pipeline_type"] == "aggregated":
+                return jsonify({
+                    "error": "aggregated_unsupported",
+                    "message": (
+                        "Aggregated NB потребує emotional/social фічі — "
+                        "вони не доступні для single-text inference. "
+                        "Викликайте /predict_deberta з aggregated pipeline."
+                    ),
+                }), 400
+
+            try:
+                proba = pipeline.predict_proba([processed])[0]
+                fake_idx = (
+                    list(pipeline.classes_).index(1)
+                    if 1 in pipeline.classes_ else 1
+                )
+                prob = float(proba[fake_idx])
+            except AttributeError:
+                # decision_function fallback (e.g. LinearSVC у пайплайні)
+                import math
+                score = float(pipeline.decision_function([processed])[0])
+                prob = 1.0 / (1.0 + math.exp(-score))
+
+            label = "FAKE" if prob > 0.5 else "REAL"
+            return jsonify({
+                "label": label,
+                "confidence": abs(prob - 0.5) * 2,
+                "probability": prob,
+            })
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error(f"NB predict failed: {e}\n{tb}")
+            return jsonify({
+                "error": "predict_failed",
                 "message": str(e),
                 "traceback": tb.splitlines()[-10:],
             }), 500
