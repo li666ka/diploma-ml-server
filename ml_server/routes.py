@@ -44,6 +44,45 @@ _GNN_EXPLAIN_TTL = 300.0  # секунд
 _NB_PIPELINE_CACHE: dict = {}
 
 
+def _nb_build_input(pipeline, processed_text: str):
+    """Підготувати input для NB pipeline залежно від його структури.
+
+    Mode A (text-only): повертає [text].
+    Mode B (text + features через ColumnTransformer): повертає DataFrame
+        з 'text_processed' заповненим, всіма іншими fitted колонками = 0.
+    Mode C (features-only, без text): повертає None — single-text inference
+        неможливий.
+    """
+    preprocessor = None
+    try:
+        preprocessor = pipeline.named_steps.get("preprocessor")
+    except AttributeError:
+        # legacy non-named pipeline
+        preprocessor = None
+
+    # Mode A
+    if preprocessor is None or not hasattr(preprocessor, "transformers_"):
+        return [processed_text]
+
+    # Mode B/C: розпарсити transformers_ що очікують
+    import pandas as pd
+
+    row: dict = {}
+    has_text_col = False
+    for _name, _transformer, cols in preprocessor.transformers_:
+        if isinstance(cols, str):
+            row[cols] = processed_text
+            has_text_col = True
+        elif isinstance(cols, (list, tuple)):
+            for col in cols:
+                row[col] = 0.0
+
+    if not has_text_col:
+        # Mode C: pipeline хоче лише фічі — single-text неможливо
+        return None
+    return pd.DataFrame([row])
+
+
 # ── DistilBERT lazy-load helper ─────────────────────────────────────────
 # Спільний для /predict_distilbert та /explain_distilbert. Повертає
 # (model, tokenizer, error_tuple). На успіх error_tuple == None; на провал —
@@ -503,8 +542,25 @@ def register_routes(app: Flask):
                     ),
                 }), 400
 
+            # Article-level NB може бути:
+            #   Mode A — Pipeline([vectorizer, classifier]) — text-only,
+            #            predict_proba(["text"]) працює.
+            #   Mode B — Pipeline([preprocessor=ColumnTransformer, classifier])
+            #            — потрібен DataFrame з 'text_processed' + feature cols.
+            #            Single-text inference: features=0 (не маємо їх).
+            #   Mode C — features only, без text. Single-text inference неможливий.
+            X = _nb_build_input(pipeline, processed)
+            if X is None:
+                return jsonify({
+                    "error": "features_required",
+                    "message": (
+                        "Ця NB модель тренувалась на features-only (use_text=False); "
+                        "single-text inference неможливий."
+                    ),
+                }), 400
+
             try:
-                proba = pipeline.predict_proba([processed])[0]
+                proba = pipeline.predict_proba(X)[0]
                 fake_idx = (
                     list(pipeline.classes_).index(1)
                     if 1 in pipeline.classes_ else 1
@@ -513,7 +569,7 @@ def register_routes(app: Flask):
             except AttributeError:
                 # decision_function fallback (e.g. LinearSVC у пайплайні)
                 import math
-                score = float(pipeline.decision_function([processed])[0])
+                score = float(pipeline.decision_function(X)[0])
                 prob = 1.0 / (1.0 + math.exp(-score))
 
             label = "FAKE" if prob > 0.5 else "REAL"
