@@ -44,42 +44,22 @@ _GNN_EXPLAIN_TTL = 300.0  # секунд
 _NB_PIPELINE_CACHE: dict = {}
 
 
-def _nb_build_input(pipeline, processed_text: str):
-    """Підготувати input для NB pipeline залежно від його структури.
+def _nb_build_input(pipeline, processed_text: str, add_feat_cols: list[str]):
+    """Підготувати input для NB pipeline (use_text=True вже гарантовано).
 
-    Mode A (text-only): повертає [text].
-    Mode B (text + features через ColumnTransformer): повертає DataFrame
-        з 'text_processed' заповненим, всіма іншими fitted колонками = 0.
-    Mode C (features-only, без text): повертає None — single-text inference
-        неможливий.
+    Mode A (no additional_features): plain [text] для TfidfVectorizer.
+    Mode B (з additional_features): DataFrame з 'text_processed' + numeric
+        cols (= 0 для single-text inference). Реальні значення фіч ми не
+        обчислюємо тут — це наближення, але без падіння.
     """
-    preprocessor = None
-    try:
-        preprocessor = pipeline.named_steps.get("preprocessor")
-    except AttributeError:
-        # legacy non-named pipeline
-        preprocessor = None
-
-    # Mode A
-    if preprocessor is None or not hasattr(preprocessor, "transformers_"):
+    if not add_feat_cols:
         return [processed_text]
 
-    # Mode B/C: розпарсити transformers_ що очікують
     import pandas as pd
 
-    row: dict = {}
-    has_text_col = False
-    for _name, _transformer, cols in preprocessor.transformers_:
-        if isinstance(cols, str):
-            row[cols] = processed_text
-            has_text_col = True
-        elif isinstance(cols, (list, tuple)):
-            for col in cols:
-                row[col] = 0.0
-
-    if not has_text_col:
-        # Mode C: pipeline хоче лише фічі — single-text неможливо
-        return None
+    row: dict = {"text_processed": processed_text}
+    for col in add_feat_cols:
+        row[col] = 0.0
     return pd.DataFrame([row])
 
 
@@ -521,6 +501,12 @@ def register_routes(app: Flask):
                     "pipeline": pipeline,
                     "preprocessing": preprocessing,
                     "pipeline_type": pipeline_type,
+                    # Bundle зберігає use_text / additional_features — це
+                    # надійніший спосіб визначити Mode A/B/C ніж duck-typing
+                    # на named_steps (Mode C step зветься "num_scaler",
+                    # не "preprocessor", і його легко переплутати з Mode A).
+                    "use_text": bool(bundle.get("use_text", True)),
+                    "additional_features": list(bundle.get("additional_features") or []),
                 }
                 if len(_NB_PIPELINE_CACHE) >= 16:
                     _NB_PIPELINE_CACHE.pop(next(iter(_NB_PIPELINE_CACHE)))
@@ -548,16 +534,23 @@ def register_routes(app: Flask):
             #   Mode B — Pipeline([preprocessor=ColumnTransformer, classifier])
             #            — потрібен DataFrame з 'text_processed' + feature cols.
             #            Single-text inference: features=0 (не маємо їх).
-            #   Mode C — features only, без text. Single-text inference неможливий.
-            X = _nb_build_input(pipeline, processed)
-            if X is None:
+            #   Mode C — features only (use_text=False, first step — MinMaxScaler).
+            #            Single-text inference неможливий.
+            use_text = cached["use_text"]
+            add_feat_cols = cached["additional_features"]
+
+            if not use_text:
+                # Mode C — без text, передавати немає що.
                 return jsonify({
                     "error": "features_required",
                     "message": (
-                        "Ця NB модель тренувалась на features-only (use_text=False); "
-                        "single-text inference неможливий."
+                        "Ця NB модель тренувалась на features-only "
+                        "(use_text=False); single-text inference неможливий."
                     ),
+                    "additional_features": add_feat_cols,
                 }), 400
+
+            X = _nb_build_input(pipeline, processed, add_feat_cols)
 
             try:
                 proba = pipeline.predict_proba(X)[0]
