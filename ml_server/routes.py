@@ -44,6 +44,86 @@ _GNN_EXPLAIN_TTL = 300.0  # секунд
 _NB_PIPELINE_CACHE: dict = {}
 
 
+def _build_nb_cache_from_bundle(bundle):
+    """Нормалізувати NB bundle до уніфікованого cache-entry.
+
+    Підтримує три формати, які зустрічаються у проєкті:
+      1. Modern: {type:"nb", pipeline, pipeline_type, use_text, additional_features, ...}
+      2. Legacy dict: {vectorizer, classifier, ...} — попередній API.
+         Синтезуємо `Pipeline([("vectorizer", v), ("classifier", c)])` —
+         щоб решта коду працювала через єдиний `pipeline.predict_proba(X)`.
+      3. Raw Pipeline (bundle = sklearn.Pipeline без обгортки).
+
+    Повертає (cache_entry_dict, error_response_or_None).
+    """
+    from sklearn.pipeline import Pipeline as _Pipeline
+
+    # ── Format 3: raw Pipeline ───────────────────────────────────────
+    if hasattr(bundle, "steps") and hasattr(bundle, "predict"):
+        log.info(
+            "NB bundle = raw Pipeline; steps=%s",
+            [(n, type(s).__name__) for n, s in bundle.steps],
+        )
+        return ({
+            "pipeline": bundle,
+            "preprocessing": {},
+            "pipeline_type": "article",
+            "use_text": True,
+            "additional_features": [],
+            "bundle_format": "raw_pipeline",
+        }, None)
+
+    if not isinstance(bundle, dict):
+        return None, (jsonify({
+            "error": "invalid_bundle",
+            "got": type(bundle).__name__,
+            "hint": "Bundle must be dict {pipeline,…} / {vectorizer,classifier,…} / Pipeline",
+        }), 400)
+
+    # ── Format 2: legacy {vectorizer, classifier} ─────────────────────
+    if "vectorizer" in bundle and "classifier" in bundle:
+        vec = bundle["vectorizer"]
+        clf = bundle["classifier"]
+        log.info(
+            "NB bundle = legacy dict; vectorizer=%s classifier=%s",
+            type(vec).__name__, type(clf).__name__,
+        )
+        synthesized = _Pipeline([("vectorizer", vec), ("classifier", clf)])
+        return ({
+            "pipeline": synthesized,
+            "preprocessing": bundle.get("preprocessing") or {},
+            "pipeline_type": bundle.get("pipeline_type", "article"),
+            "use_text": True,
+            "additional_features": list(bundle.get("additional_features") or []),
+            "bundle_format": "legacy_dict",
+        }, None)
+
+    # ── Format 1: modern {pipeline, type:"nb", …} ─────────────────────
+    pipeline = bundle.get("pipeline")
+    if pipeline is None:
+        return None, (jsonify({
+            "error": "missing_pipeline",
+            "message": "Bundle has no 'pipeline' field and no legacy {vectorizer,classifier}",
+            "bundle_keys": list(bundle.keys()),
+        }), 500)
+
+    if bundle.get("type") not in (None, "nb"):
+        return None, (jsonify({
+            "error": "wrong_model_type",
+            "expected": "nb",
+            "got": bundle.get("type"),
+        }), 400)
+
+    return ({
+        "pipeline": pipeline,
+        "preprocessing": bundle.get("preprocessing") or {},
+        "pipeline_type": bundle.get("pipeline_type", "article"),
+        "use_text": bool(bundle.get("use_text", True)),
+        "additional_features": list(bundle.get("additional_features") or []),
+        "bundle_format": "modern_bundle",
+    }, None)
+
+
 def _detect_nb_mode(pipeline) -> str:
     """Authoritative детектор Mode за фактичним типом першого pipeline-кроку.
 
@@ -491,6 +571,52 @@ def register_routes(app: Flask):
                 "traceback": tb.splitlines()[-10:],
             }), 500
 
+    @app.route("/debug_bundle", methods=["POST"])
+    def debug_bundle():
+        """Inspect bundle structure без запуску prediction.
+
+        Payload: {model_path}. Повертає keys / types / pipeline.steps —
+        корисно для діагностики невідомого формату .pkl.
+        """
+        import joblib
+
+        data = request.json or {}
+        model_path = data.get("model_path")
+        if not model_path or not os.path.exists(model_path):
+            return jsonify({"error": "path_not_found", "model_path": model_path}), 404
+
+        try:
+            bundle = joblib.load(model_path)
+        except Exception as e:
+            return jsonify({"error": "load_failed", "message": str(e)}), 500
+
+        info: dict = {
+            "model_path": model_path,
+            "type": type(bundle).__name__,
+        }
+        # Раз обʼєкт — Pipeline без обгортки
+        if hasattr(bundle, "steps"):
+            info["steps"] = [(n, type(s).__name__) for n, s in bundle.steps]
+        if isinstance(bundle, dict):
+            info["keys"] = sorted(bundle.keys())
+            per_key: dict = {}
+            for k, v in bundle.items():
+                entry: dict = {"type": type(v).__name__}
+                if hasattr(v, "steps"):
+                    entry["steps"] = [(n, type(s).__name__) for n, s in v.steps]
+                if hasattr(v, "transformers_"):
+                    entry["transformers"] = [
+                        (n, type(t).__name__, str(c)[:80])
+                        for n, t, c in v.transformers_
+                    ]
+                if isinstance(v, (str, int, float, bool)):
+                    entry["value"] = v
+                elif isinstance(v, list) and len(v) < 20:
+                    entry["value"] = v
+                per_key[k] = entry
+            info["per_key"] = per_key
+        return jsonify(info)
+
     @app.route("/predict_nb", methods=["POST"])
     def predict_nb():
         """Inference для NB bundle (joblib pickle з `pipeline`).
@@ -531,35 +657,16 @@ def register_routes(app: Flask):
             cached = _NB_PIPELINE_CACHE.get(model_path)
             if cached is None:
                 bundle = joblib.load(model_path)
-                if not isinstance(bundle, dict) or bundle.get("type") != "nb":
-                    return jsonify({
-                        "error": "wrong_model_type",
-                        "expected": "nb",
-                        "got": bundle.get("type") if isinstance(bundle, dict) else "non-dict",
-                    }), 400
-                pipeline = bundle.get("pipeline")
-                if pipeline is None:
-                    return jsonify({
-                        "error": "missing_pipeline",
-                        "message": "NB bundle has no 'pipeline' field",
-                    }), 500
-                preprocessing = bundle.get("preprocessing") or {}
-                pipeline_type = bundle.get("pipeline_type", "article")
-                cached = {
-                    "pipeline": pipeline,
-                    "preprocessing": preprocessing,
-                    "pipeline_type": pipeline_type,
-                    # Bundle зберігає use_text / additional_features — це
-                    # надійніший спосіб визначити Mode A/B/C ніж duck-typing
-                    # на named_steps (Mode C step зветься "num_scaler",
-                    # не "preprocessor", і його легко переплутати з Mode A).
-                    "use_text": bool(bundle.get("use_text", True)),
-                    "additional_features": list(bundle.get("additional_features") or []),
-                }
+                cached, load_err = _build_nb_cache_from_bundle(bundle)
+                if load_err is not None:
+                    return load_err
                 if len(_NB_PIPELINE_CACHE) >= 16:
                     _NB_PIPELINE_CACHE.pop(next(iter(_NB_PIPELINE_CACHE)))
                 _NB_PIPELINE_CACHE[model_path] = cached
-                log.info(f"Lazy loaded NB bundle: {model_path}")
+                log.info(
+                    "Lazy loaded NB bundle: %s [format=%s]",
+                    model_path, cached["bundle_format"],
+                )
 
             pipeline = cached["pipeline"]
             processed = preprocess_text(text, cached["preprocessing"]) or text
