@@ -637,6 +637,8 @@ def register_routes(app: Flask):
         data = request.json or {}
         text = data.get("text", "") or ""
         model_path = data.get("model_path")
+        explain = bool(data.get("explain", False))
+        feature_values = data.get("feature_values")  # опційно для Mode B/C
 
         if not text.strip():
             return jsonify({
@@ -719,11 +721,25 @@ def register_routes(app: Flask):
                 prob = 1.0 / (1.0 + math.exp(-score))
 
             label = "FAKE" if prob > 0.5 else "REAL"
-            return jsonify({
+            response: dict = {
                 "label": label,
                 "confidence": abs(prob - 0.5) * 2,
                 "probability": prob,
-            })
+            }
+            # Inline explanation коли клієнт просить (1 round-trip замість 2)
+            if explain:
+                try:
+                    from ml_server.explainer_nb import explain_nb_prediction
+                    response["explanation"] = explain_nb_prediction(
+                        model_path=model_path,
+                        text=text,
+                        feature_values=feature_values,
+                    )
+                except Exception as e:
+                    import traceback
+                    log.error(f"explain_nb inline failed: {e}\n{traceback.format_exc()}")
+                    response["explanation_error"] = str(e)[:300]
+            return jsonify(response)
         except Exception as e:
             import traceback
             tb = traceback.format_exc()

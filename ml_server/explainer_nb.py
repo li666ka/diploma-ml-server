@@ -114,7 +114,15 @@ def explain_nb_prediction(
         #   [("text_vec", vec, "text_processed"), ("num_scaler", scaler, add_feat_cols)]).
         # Для Mode C text_feature_count=0, тож feature_diffs = весь diff.
         feature_diffs = diff[text_feature_count:]
-        fv = feature_values or {}
+
+        # Якщо caller не передав feature_values — обчислюємо їх локально через
+        # ту саму функцію, що тренер. Social/graph features тоді нульові
+        # (потребують user/tweet/df), text-based (emotional, stylistic,
+        # rhetorical) — корректні з самого тексту.
+        fv = feature_values
+        if fv is None:
+            fv = _auto_extract_features(text, additional_features)
+
         for i, fname in enumerate(additional_features):
             if i >= len(feature_diffs):
                 break
@@ -152,3 +160,36 @@ def explain_nb_prediction(
         "total_log_odds": total,
         "prediction": "FAKE" if total > 0 else "REAL",
     }
+
+
+def _auto_extract_features(text: str, feature_names: list[str]) -> dict:
+    """Обчислити handcrafted features локально через ml_server.features.extract_features.
+
+    Покриває:
+      - emotional (NRC lookup з тексту) — корректно
+      - stylistic / rhetorical (caps_ratio, ttr, ...) — корректно
+      - social/graph (cascade-based) — НЕ обчислюються (потрібен
+        user_row/tweet_row/df), повертаються 0.0
+
+    Якщо щось падає (брак NRC lexicon тощо) — degraded mode: всі 0.0.
+    Це краще за крах endpoint'у.
+    """
+    try:
+        from ml_server.features import extract_features, nrc_el, nrc_eil
+        result = extract_features(
+            text, nrc_el, nrc_eil, feature_names,
+            user_row=None,
+            tweet_row=None,
+            article_tweets_df=None,
+            article_retweets_df=None,
+            article_replies_df=None,
+            article_id=None,
+            tweet_engagement_lookup=None,
+        )
+        # extract_features може повертати pd.Series / dict — нормалізуємо
+        if hasattr(result, "to_dict"):
+            result = result.to_dict()
+        return {fname: float(result.get(fname, 0.0) or 0.0) for fname in feature_names}
+    except Exception as e:
+        log.warning(f"_auto_extract_features failed: {e}")
+        return {fname: 0.0 for fname in feature_names}
