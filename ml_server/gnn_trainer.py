@@ -47,6 +47,15 @@ def evaluate_gnn(model, loader, device):
         all_labels.append(labels.cpu())
         all_probs.append(probs.cpu())
 
+    if not all_preds:
+        raise RuntimeError(
+            "evaluate_gnn: loader produced zero batches — split has no "
+            "graphs. Usually means every article in this split was skipped "
+            "by build_all_graphs because its embedding is missing from the "
+            "cache. Re-run with force_recompute_embeddings=true or check "
+            "that splits_subdir matches the cached articles."
+        )
+
     all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
     all_probs = torch.cat(all_probs).numpy()

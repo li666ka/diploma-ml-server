@@ -462,10 +462,30 @@ def encode_incrementally_memmap(
         if cached:
             log.info(f"[{name}] loading from memmap cache...")
             try:
-                lookups[name] = MemmapLookup(npy_path, ids_path)
-                cache_hits[name] = "hit"
-                _log_ram(name, "after_cache_hit")
-                continue
+                candidate = MemmapLookup(npy_path, ids_path)
+                # Coverage check: the source_hash matches news.csv, but the
+                # cache was built on whatever articles_df was passed at the
+                # time. If splits changed (different splits_subdir, etc.) the
+                # current articles_df may include ids the cache never saw.
+                # build_all_graphs would silently skip those articles → empty
+                # test_loader → torch.cat([]) crash. Detect here and rebuild.
+                needed_ids = {str(x) for x in df[id_col].tolist()}
+                missing = needed_ids - candidate.id_to_row.keys()
+                if missing:
+                    log.warning(
+                        f"[{name}] cache covers {len(candidate):,} ids but "
+                        f"current dataset needs {len(missing):,} more "
+                        f"(e.g. {next(iter(missing))!r}) — rebuilding"
+                    )
+                    if npy_path.exists():
+                        npy_path.unlink()
+                    if ids_path.exists():
+                        ids_path.unlink()
+                else:
+                    lookups[name] = candidate
+                    cache_hits[name] = "hit"
+                    _log_ram(name, "after_cache_hit")
+                    continue
             except CorruptMemmapCache as e:
                 log.warning(f"[{name}] {e} — re-encoding from scratch")
                 if npy_path.exists():
